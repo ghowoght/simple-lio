@@ -103,6 +103,19 @@ struct ModelParam{
     double gyro_bias_corr_time;             // 陀螺仪零偏相关时间
     double accel_bias_std;                  // 加速度计零偏标准差
     double accel_bias_corr_time;            // 加速度计零偏相关时间
+    QD R_L_I = QD::Identity();              // IMU坐标系到点云坐标系的旋转
+    V3D T_L_I;                              // IMU坐标系到点云坐标系的变换
+    void init_r_l_i(double roll, double pitch, double yaw){
+        R_L_I.x()=sin(pitch/2)*sin(yaw/2)*cos(roll/2)+cos(pitch/2)*cos(yaw/2)*sin(roll/2);
+        R_L_I.y()=sin(pitch/2)*cos(yaw/2)*cos(roll/2)+cos(pitch/2)*sin(yaw/2)*sin(roll/2);
+        R_L_I.z()=cos(pitch/2)*sin(yaw/2)*cos(roll/2)-sin(pitch/2)*cos(yaw/2)*sin(roll/2);
+        R_L_I.w()=cos(pitch/2)*cos(yaw/2)*cos(roll/2)-sin(pitch/2)*sin(yaw/2)*sin(roll/2);
+    }
+    void init_t_l_i(double x, double y, double z){
+        T_L_I(0) = x;
+        T_L_I(1) = y;
+        T_L_I(2) = z;
+    }
 };
 
 class IMUProcess{
@@ -195,22 +208,24 @@ private:
     void backward_propagation(MeasureData& measure){
         auto size = measure.imu_queue.size();
 
-        StateEKF state_curr;
-        state_curr.time = measure.pcl_end_time;
+        StateEKF state_curr = state_queue_.back();
+        state_curr.pos = V3D(0, 0, 0);
+        state_curr.vel = state_curr.rot.conjugate() * state_curr.vel; // 变换到I系
+        state_curr.grav = state_curr.rot.conjugate() * state_curr.grav; // 变换到I系
+        state_curr.rot = QD::Identity();
+        state_curr.time = measure.imu_queue.back().time; // measure.pcl_end_time;
         state_bp_queue_.clear();
         state_bp_queue_.push_back(state_curr);
 
         
-        for(int i = 0; i < size; i++){
-            auto imu = measure.imu_queue[size - 1 - i];
+        for(int i = size - 1; i > 0; i--){
+            double dt = state_curr.time - measure.imu_queue[i - 1].time;
+            state_curr.time = measure.imu_queue[i - 1].time;
 
-            double dt = state_curr.time - imu.time;
-            // 姿态更新
+            auto imu = measure.imu_queue[i];
             M3D R = state_curr.rot.toRotationMatrix() * SO3Math::Exp(-imu.gyro_rps * dt);
             state_curr.rot = QD(R);            
-            // 速度更新
             state_curr.vel -= (state_curr.rot * imu.accel_mpss - state_curr.grav) * dt;
-            // 位置更新
             state_curr.pos -= state_curr.vel * dt;
 
             state_bp_queue_.push_back(state_curr);
@@ -218,43 +233,99 @@ private:
         state_bp_queue_.push_back(state_last_);
     }
 
-    void point_cloud_undistort(MeasureData& measure){
-        // 根据每一点的
-        auto ptr = measure.cloud;
-        auto&& cloud = *ptr;
+    void point_cloud_undistort(MeasureData& measure, PointCloud& pcl_in, PointCloud& pcl_out){
 
-        // 特征提取
-        ScanRegistration scan_registration;
-        scan_registration.feature_extract(cloud);
-
-        auto& cloud_surf = scan_registration.pointSurf;
+        pcl_out = pcl_in;
 
         // 将每一点投影到扫描结束时刻的惯导坐标系下    
-        for(int i = 0; i < cloud_surf.size(); i++){
-            // std::cout << "curvature: " << cloud_surf[i].curvature << std::endl;
+        int idx = 0;
+        for(int i = pcl_in.size(); i >= 0; i--){
+            auto& point_curr = pcl_in[i];
+            double time_interval = 0.1;
+            double time_curr_point = measure.pcl_beg_time + point_curr.curvature * time_interval;
+
+            if(time_curr_point > state_bp_queue_[idx].time){
+                V3D p_l_i(pcl_out[i].x, pcl_out[i].y, pcl_out[i].z);
+                V3D p_b_i = model_param_.R_L_I * p_l_i + model_param_.T_L_I; // 转换到惯导坐标系下
+                pcl_out[i].x = p_b_i.x();
+                pcl_out[i].y = p_b_i.y();
+                pcl_out[i].z = p_b_i.z();
+                continue;
+            }
+            while(time_curr_point < state_bp_queue_[idx + 1].time){
+                idx++;
+            }
+            if(time_curr_point > state_bp_queue_[idx + 1].time){
+                auto imu = measure.imu_queue[measure.imu_queue.size() - 1 - idx];
+                double dt = state_bp_queue_[idx].time - time_curr_point;
+                // std::cout << "idx: " << idx <<" dt: " << dt << std::endl;
+                auto state_curr = state_bp_queue_[idx];
+                M3D R = state_curr.rot.toRotationMatrix() * SO3Math::Exp(-imu.gyro_rps * dt);
+                state_curr.rot = QD(R);            
+                state_curr.vel -= (state_curr.rot * imu.accel_mpss - state_curr.grav) * dt;
+                state_curr.pos -= state_curr.vel * dt;
+                V3D p_l_i(pcl_out[i].x, pcl_out[i].y, pcl_out[i].z);
+                V3D p_b_i = model_param_.R_L_I * p_l_i + model_param_.T_L_I; // 转换到惯导坐标系下
+                V3D p_b_end = state_curr.rot * p_l_i + state_curr.pos;      // 转换到扫描结束时刻的惯导坐标系下
+                pcl_out[i].x = p_b_end.x();
+                pcl_out[i].y = p_b_end.y();
+                pcl_out[i].z = p_b_end.z();
+
+                // std::cout << "p_b_end: " << p_b_end.transpose() << std::endl;
+            }
+            
+
+        }
+        // std::cout << "----------------------------------------------------" << std::endl;
+    }
+
+    void update(MeasureData& measure, PointCloud& pcl_features){
+        auto state_curr = state_queue_.back();
+        Eigen::Matrix<double, 6, 6> Hmat = Eigen::Matrix<double, 6, 6>::Zero();
+        for(int iter = 0; iter < 10; iter++){
+            // 观测矩阵
 
         }
     }
 
 public:
-
+ 
     void process(MeasureData& measure){
         if(!is_initialized_){
             is_initialized_ = true;
             state_last_ = StateEKF();
+            state_last_.grav = V3D(0, 0, -9.8);
             state_last_.time = measure.imu_queue.back().time;
             state_queue_.clear();
             return;
         }
 
+        // 原始数据补偿
+        for(auto& imu : measure.imu_queue){
+            imu.accel_mpss  -= state_last_.ba;
+            imu.gyro_rps    -= state_last_.bg;
+        }
         // 前向传播
         forward_propagation(measure);
 
         // 反向传播
         backward_propagation(measure);
 
+        // 特征提取
+        ScanRegistration scan_registration;
+        scan_registration.feature_extract(*measure.cloud);
+        auto& cloud_surf = scan_registration.pointSurf;
+
         // 点云运动补偿
-        point_cloud_undistort(measure);
+        PointCloud pcl_out;
+        point_cloud_undistort(measure, cloud_surf, pcl_out);
+
+        // 点云迭代更新
+        update(measure, pcl_out);
+
+        // 误差状态修正
+
+        delta_x_ = Eigen::Matrix<double, N, 1>::Zero();
 
         if(1){
             state_last_ = state_queue_.back();
