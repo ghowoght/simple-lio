@@ -140,6 +140,7 @@ private:
 
     Eigen::Matrix<double, Eigen::Dynamic, 1> delta_z_;
     Eigen::Matrix<double, Eigen::Dynamic, N> Hmat_;
+    Eigen::Matrix<double, N, Eigen::Dynamic> Kmat_;
 
     // 地图相关
     std::vector<PointCloud::Ptr> surf_cloud_queue_;
@@ -153,6 +154,15 @@ public:
     IMUProcess(const ModelParam& model_param) : model_param_(model_param){
         map_surf_cloud_ = boost::make_shared<PointCloud>();
         state_last_ = StateEKF();
+        M3D gb = Eigen::Vector3d(model_param.gyro_bias_std * model_param.gyro_bias_std, 
+                                model_param.gyro_bias_std * model_param.gyro_bias_std, 
+                                model_param.gyro_bias_std * model_param.gyro_bias_std).asDiagonal();
+        M3D ab = Eigen::Vector3d(model_param.accel_bias_std * model_param.accel_bias_std, 
+                                model_param.accel_bias_std * model_param.accel_bias_std, 
+                                model_param.accel_bias_std * model_param.accel_bias_std).asDiagonal();
+        Pmat_ = Eigen::Matrix<double, N, N>::Zero();
+        Pmat_.block<3, 3>(9, 9) = gb;
+        Pmat_.block<3, 3>(12, 12) = ab;
     }
 
 private:
@@ -303,22 +313,27 @@ private:
         double res;      // 残差
     };
 
-    void update(MeasureData& measure, PointCloud::Ptr& pcl_features){
+    void iterate_update(MeasureData& measure, PointCloud::Ptr& pcl_features){
+        // ROS_INFO("map_surf_cloud: %d", map_surf_cloud_->size());
         kdtree_.setInputCloud(map_surf_cloud_);
         // KD-Tree最近邻搜索结果的索引和距离
         std::vector<int> pointSearchInd;
         std::vector<float> pointSearchSqDis;
 
-        auto state_curr = state_queue_.back();
-        for(int iter = 0; iter < 10; iter++){
+        auto state_curr_iter = state_queue_.back();
+        auto state_last_iter = state_queue_.back();
+        auto state_iter_0 = state_queue_.back(); // 迭代前的状态
+        Eigen::Matrix<double, N, N> Jmat = Eigen::Matrix<double, N, N>::Identity();
+        Eigen::Matrix<double, N, N> Jmat_inv = Eigen::Matrix<double, N, N>::Identity();
+        for(int iter = 0; iter < 5; iter++){
 
             std::vector<EffectFeature> effect_feature_queue;
-
+            // ROS_INFO("pcl_features: %d", pcl_features->size());
             for(int i = 0; i < pcl_features->size(); i++){
                 auto p = (*pcl_features)[i];
                 // 投影到世界坐标系
                 V3D cp(p.x, p.y, p.z);
-                V3D wp = state_curr.rot * cp + state_curr.pos;
+                V3D wp = state_curr_iter.rot * cp + state_curr_iter.pos;
                 p.x = wp.x();
                 p.y = wp.y();
                 p.z = wp.z();
@@ -364,17 +379,50 @@ private:
             for(int i = 0; i < effect_feature_queue.size(); i++){
                 auto& ef = effect_feature_queue[i];
                 Hmat_.block<1, 3>(i, 0) =  ef.norm_vec.transpose();
-                Hmat_.block<1, 3>(i, 6) = -ef.norm_vec.transpose() * state_curr.rot.toRotationMatrix() * SO3Math::get_skew_symmetric(ef.pb);
+                Hmat_.block<1, 3>(i, 6) = -ef.norm_vec.transpose() * state_curr_iter.rot.toRotationMatrix() * SO3Math::get_skew_symmetric(ef.pb);
                 delta_z_(i) = ef.res;
             }
             Eigen::Matrix<double, Eigen::Dynamic, Eigen::Dynamic> Rmat 
-                = Eigen::MatrixXd::Identity(effect_feature_queue.size(), effect_feature_queue.size()) * 0.001;
-            Eigen::Matrix<double, N, Eigen::Dynamic> Kmat 
-                = (Hmat_.transpose() * Rmat.inverse() * Hmat_ + Pmat_.inverse()).inverse() * Hmat_.transpose() * Rmat.inverse();
+                = Eigen::MatrixXd::Identity(effect_feature_queue.size(), effect_feature_queue.size()) * 0.01;
+            Eigen::Matrix<double, Eigen::Dynamic, Eigen::Dynamic> Rmat_inv 
+                = Eigen::MatrixXd::Identity(effect_feature_queue.size(), effect_feature_queue.size()) * 100;
+
+            auto dx = delta_x_;
+            dx.block<3, 1>( 0, 0) = state_curr_iter.pos - state_iter_0.pos;
+            dx.block<3, 1>( 3, 0) = state_curr_iter.vel - state_iter_0.vel;
+            dx.block<3, 1>( 6, 0) = SO3Math::Log(state_iter_0.rot.toRotationMatrix().transpose() 
+                                    * state_curr_iter.rot.toRotationMatrix());
+            dx.block<3, 1>( 9, 0) = state_curr_iter.bg - state_iter_0.bg;
+            dx.block<3, 1>(12, 0) = state_curr_iter.ba - state_iter_0.ba;
+            dx.block<3, 1>(15, 0) = state_curr_iter.grav - state_iter_0.grav;
+
+            std::cout << "dx: " << dx.transpose() << std::endl;
             
+            // auto J_l_inv = SO3Math::J_l_inv(dx.block<3, 1>( 6, 0));
+            // Jmat.block<3, 3>(6, 6) = J_l_inv.transpose();
+            auto J_l = SO3Math::J_l(dx.block<3, 1>( 6, 0));
+            Jmat_inv.block<3, 3>(6, 6) = J_l.transpose();
+            Pmat_ = Jmat_inv * Pmat_ * Jmat_inv.transpose();
+            // 卡尔曼增益
+            // Kmat_ = Pmat_ * Hmat_.transpose() * (Hmat_ * Pmat_ * Hmat_.transpose() + Rmat).inverse();
+            Kmat_ = (Hmat_.transpose() * Rmat_inv * Hmat_ + Pmat_.inverse()).inverse() * Hmat_.transpose() * Rmat_inv;
+            std::cout << "Kmat_: " << Kmat_ << std::endl;
 
+            // 状态迭代
+            auto delta = -Kmat_ * delta_z_ - (Eigen::Matrix<double, N, N>::Identity() - Kmat_ * Hmat_) * Jmat_inv * dx;
 
+            std::cout << delta.transpose() << std::endl;
+            state_curr_iter.pos = state_last_iter.pos + delta.block<3, 1>( 0, 0);
+            state_curr_iter.vel = state_last_iter.vel + delta.block<3, 1>( 3, 0);
+            state_curr_iter.rot = state_last_iter.rot * SO3Math::Exp(delta.block<3, 1>( 6, 0));
+            state_curr_iter.bg = state_last_iter.bg + delta.block<3, 1>( 9, 0);
+            state_curr_iter.ba = state_last_iter.ba + delta.block<3, 1>(12, 0);
+            // state_curr_iter.grav = state_last_iter.grav + delta.block<3, 1>(15, 0);
+
+            state_last_iter = state_curr_iter;
         }
+        state_last_ = state_curr_iter;
+        
     }
 
 public:
@@ -385,7 +433,7 @@ public:
             state_last_.bg += imu.gyro_rps;
             cnt++;
         }
-        if(cnt > 2000){
+        if(cnt > 1000){
             state_last_.grav << 0, 0, -9.7936;
             state_last_.bg /= cnt;
             state_last_.ba /= cnt;
@@ -439,7 +487,7 @@ public:
         point_cloud_undistort(measure, cloud_surf, pcl_out);
 
         // 点云迭代更新
-        update(measure, pcl_out);
+        iterate_update(measure, pcl_out);
 
         // 误差状态修正
         delta_x_ = Eigen::Matrix<double, N, 1>::Zero();
@@ -469,11 +517,11 @@ public:
             surf_cloud_queue_.erase(surf_cloud_queue_.begin());
 
         if(1){
-            state_last_ = state_queue_.back();
+            // state_last_ = state_queue_.back();
             state_queue_.clear();
             auto euler = SO3Math::quat2euler(state_last_.rot);
             euler = euler * 180 / M_PI;
-            std::cout << "time: " << state_last_.time << " euler: " << euler.transpose()<< std::endl;
+            std::cout << std::setprecision(15) << "time: " << state_last_.time << " euler: " << euler.transpose()<< std::endl;
         }
     }
 
