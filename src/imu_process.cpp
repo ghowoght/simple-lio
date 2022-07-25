@@ -12,7 +12,7 @@
 
 int main(int argc, char** argv)
 {
-    ros::init(argc, argv, "simple_lio");
+    ros::init(argc, argv, "imu_process");
     ros::NodeHandle nh;
 
     std::queue<MeasureData> measure_queue;
@@ -48,11 +48,15 @@ int main(int argc, char** argv)
 
     ROS_INFO("imu_process start");
 
+    IMUProcess imu_process;
+
     while(ros::ok()){
         if(!measure_queue.empty()){
             // ROS_INFO("meas size: %d, time1: %f, time2: %f", measure_queue.size(), measure_queue.back().imu_queue.front().time, measure_queue.back().pcl_beg_time);
             // ROS_INFO("meas size: %d, time1: %f, time2: %f", measure_queue.size(), measure_queue.back().imu_queue.back().time, measure_queue.back().pcl_end_time);
             auto&& meas = measure_queue.front();
+            imu_process.process(meas);
+            measure_queue.pop();
         }
         ros::spinOnce();
         std::this_thread::sleep_for(std::chrono::milliseconds(1));
