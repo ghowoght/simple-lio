@@ -98,7 +98,6 @@ struct MeasureData{
     PointCloud::Ptr cloud;
     double pcl_beg_time;
     double pcl_end_time;
-    
 };
 
 struct ModelParam{
@@ -139,10 +138,14 @@ private:
     Eigen::Matrix<double, N, 12> Gmat_; // 噪声输入映射矩阵 noise-input mapping matrix
     Eigen::Matrix<double, N, 12> Gmat_last_;
 
+    Eigen::Matrix<double, Eigen::Dynamic, 1> delta_z_;
+    Eigen::Matrix<double, Eigen::Dynamic, N> Hmat_;
+
     // 地图相关
     std::vector<PointCloud::Ptr> surf_cloud_queue_;
     PointCloud::Ptr map_surf_cloud_;
     double map_res_ = 0.2;
+    pcl::KdTreeFLANN<PointType> kdtree_;
 
 
 public:
@@ -290,16 +293,86 @@ private:
                 // std::cout << "p_b_end: " << p_b_end.transpose() << std::endl;
             }
             
-
         }
         // std::cout << "----------------------------------------------------" << std::endl;
     }
 
+    struct EffectFeature{
+        V3D pb;          // 点的I系坐标
+        V3D norm_vec; // 法向量
+        double res;      // 残差
+    };
+
     void update(MeasureData& measure, PointCloud::Ptr& pcl_features){
+        kdtree_.setInputCloud(map_surf_cloud_);
+        // KD-Tree最近邻搜索结果的索引和距离
+        std::vector<int> pointSearchInd;
+        std::vector<float> pointSearchSqDis;
+
         auto state_curr = state_queue_.back();
-        Eigen::Matrix<double, 6, 6> Hmat = Eigen::Matrix<double, 6, 6>::Zero();
         for(int iter = 0; iter < 10; iter++){
-            // 观测矩阵
+
+            std::vector<EffectFeature> effect_feature_queue;
+
+            for(int i = 0; i < pcl_features->size(); i++){
+                auto p = (*pcl_features)[i];
+                // 投影到世界坐标系
+                V3D cp(p.x, p.y, p.z);
+                V3D wp = state_curr.rot * cp + state_curr.pos;
+                p.x = wp.x();
+                p.y = wp.y();
+                p.z = wp.z();
+                // 最近邻搜索
+                kdtree_.nearestKSearch(p, 8, pointSearchInd, pointSearchSqDis);
+                // 最近邻都在指定范围内
+                if (pointSearchSqDis[7] < 5){
+                    // 计算质心和协方差
+                    PointCloudXYZI nearest;
+                    for (int k = 0; k < pointSearchInd.size(); k++)
+                    {
+                        nearest.push_back((*map_surf_cloud_)[pointSearchInd[k]]);
+                    }
+                    Eigen::Vector4f centroid;   // 质心
+                    Eigen::Matrix3f covariance; // 协方差
+                    pcl::compute3DCentroid(nearest, centroid);
+                    pcl::computeCovarianceMatrix(nearest, centroid, covariance);
+
+                    // 计算协方差矩阵的特征值
+                    Eigen::Vector3f eigenValues;
+                    pcl::eigen33(covariance, eigenValues);
+
+                    std::vector<float> eigenValues_sort{eigenValues[0], eigenValues[1], eigenValues[2]};
+                    std::sort(eigenValues_sort.begin(), eigenValues_sort.end()); // 升序排列
+                    // 最近邻在一个平面上
+                    if (eigenValues_sort[1] > 3 * eigenValues_sort[0])
+                    {
+                        Eigen::Vector3d lpj{nearest[0].x, nearest[0].y, nearest[0].z};
+                        Eigen::Vector3d lpl{nearest[4].x, nearest[4].y, nearest[4].z};
+                        Eigen::Vector3d lpm{nearest[7].x, nearest[7].y, nearest[7].z};
+                        // 计算jlm的归一化法向量
+                        V3D ljm = (lpj - lpl).cross(lpj - lpm);
+                        ljm.normalize();
+                        double res = (wp - lpj).dot(ljm);
+                        double s = 1 - 0.9 * fabs(res) / sqrt(cp.norm());
+                        if(s > 0.9)
+                            effect_feature_queue.push_back(EffectFeature{cp, ljm, res});
+                    }
+                }
+            }
+            Hmat_ = Eigen::MatrixXd::Zero(effect_feature_queue.size(), N);
+            delta_z_ = Eigen::VectorXd::Zero(effect_feature_queue.size());
+            for(int i = 0; i < effect_feature_queue.size(); i++){
+                auto& ef = effect_feature_queue[i];
+                Hmat_.block<1, 3>(i, 0) =  ef.norm_vec.transpose();
+                Hmat_.block<1, 3>(i, 6) = -ef.norm_vec.transpose() * state_curr.rot.toRotationMatrix() * SO3Math::get_skew_symmetric(ef.pb);
+                delta_z_(i) = ef.res;
+            }
+            Eigen::Matrix<double, Eigen::Dynamic, Eigen::Dynamic> Rmat 
+                = Eigen::MatrixXd::Identity(effect_feature_queue.size(), effect_feature_queue.size()) * 0.001;
+            Eigen::Matrix<double, N, Eigen::Dynamic> Kmat 
+                = (Hmat_.transpose() * Rmat.inverse() * Hmat_ + Pmat_.inverse()).inverse() * Hmat_.transpose() * Rmat.inverse();
+            
+
 
         }
     }
@@ -394,8 +467,6 @@ public:
         map_surf_cloud_ = surf_filtered;
         if (map_surf_cloud_->size() > 16000)
             surf_cloud_queue_.erase(surf_cloud_queue_.begin());
-
-
 
         if(1){
             state_last_ = state_queue_.back();
