@@ -37,8 +37,8 @@ typedef pcl::PointCloud<PointType> PointCloudXYZI;
 class ScanRegistration{
 
 public:
-    PointCloudXYZI pointEdge;      // 边缘点
-    PointCloudXYZI pointSurf;      // 平面点
+    PointCloudXYZI::Ptr pointEdge;      // 边缘点
+    PointCloudXYZI::Ptr pointSurf;      // 平面点
 
 private:
     // ros::NodeHandle nh_;
@@ -47,22 +47,24 @@ private:
     // ros::Publisher pub_edge_cloud;
     // ros::Publisher pub_surf_cloud;
 public:
-    void feature_extract(pcl::PointCloud<PointType>& laserCloudIn){
+    void feature_extract(pcl::PointCloud<PointType>::Ptr& laserCloudIn){
+        pointEdge = boost::make_shared<PointCloudXYZI>();
+        pointSurf = boost::make_shared<PointCloudXYZI>();
 
         // 预处理
-        int cloudSize = laserCloudIn.points.size();
+        int cloudSize = laserCloudIn->points.size();
         PointCloudXYZI allPoints;
         for(size_t i = 1; i < cloudSize - 1; i++){
-            auto point = laserCloudIn.points[i];
+            auto point = laserCloudIn->points[i];
             auto dist = sqrt(point.x * point.x + point.y * point.y + point.z * point.z);
             auto phi = atan(sqrt((point.y * point.y + point.z * point.z) / (point.x * point.x))); // 光束与激光雷达x轴的夹角
 
-            auto reflectivity = (laserCloudIn.points[i].intensity - (int)laserCloudIn.points[i].intensity) * 10000;
+            auto reflectivity = (laserCloudIn->points[i].intensity - (int)laserCloudIn->points[i].intensity) * 10000;
             auto intensity = reflectivity / (dist * dist);
 
-            auto a = laserCloudIn.points[i - 1];
-            auto b = laserCloudIn.points[i];
-            auto c = laserCloudIn.points[i + 1];
+            auto a = laserCloudIn->points[i - 1];
+            auto b = laserCloudIn->points[i];
+            auto c = laserCloudIn->points[i + 1];
             Eigen::Vector3d pa{a.x, a.y, a.z};
             Eigen::Vector3d pb{b.x, b.y, b.z};
             Eigen::Vector3d pc{c.x, c.y, c.z};
@@ -88,8 +90,8 @@ public:
 
         int cloudFeatureFlag[32000] = {0};
        
-        pointEdge.clear();      // 边缘点
-        pointSurf.clear();      // 平面点
+        pointEdge->clear();      // 边缘点
+        pointSurf->clear();      // 平面点
         bool left_surf_flag = false;
         bool right_surf_flag = false;
         int step = 1;
@@ -344,15 +346,15 @@ public:
         // 对特征进行汇总
         for(size_t i = 0; i < cloudSize; i++){
             if(cloudFeatureFlag[i] == TYPE_SURF)
-                pointSurf.push_back(laserCloud->points[i]);
+                pointSurf->push_back(laserCloud->points[i]);
             else if(cloudFeatureFlag[i] == TYPE_CORNER || cloudFeatureFlag[i] == TYPE_BREAK_POINT)
-                pointEdge.push_back(laserCloud->points[i]);
+                pointEdge->push_back(laserCloud->points[i]);
         }
         
         // std::cout << "--------------------------\n"
         //             << "All points : " << cloudSize << std::endl
-        //             << "Edge points: " << pointEdge.size() << std::endl
-        //             << "Surf points: " << pointSurf.size() << std::endl;
+        //             << "Edge points: " << pointEdge->size() << std::endl
+        //             << "Surf points: " << pointSurf->size() << std::endl;
 
         // 发布点云消息
         // sensor_msgs::PointCloud2 laserCloudMsgOut;
