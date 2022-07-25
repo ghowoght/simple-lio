@@ -15,6 +15,11 @@
 #include <Eigen/Dense>
 #include <pcl/point_types.h>
 #include <pcl/point_cloud.h>
+#include <pcl/kdtree/kdtree_flann.h>
+#include <pcl/filters/voxel_grid.h>
+#include <pcl/common/centroid.h>
+#include <pcl/common/eigen.h>
+
 #include <vector>
 #include <queue>
 
@@ -134,9 +139,18 @@ private:
     Eigen::Matrix<double, N, 12> Gmat_; // 噪声输入映射矩阵 noise-input mapping matrix
     Eigen::Matrix<double, N, 12> Gmat_last_;
 
+    // 地图相关
+    std::vector<PointCloud::Ptr> surf_cloud_queue_;
+    PointCloud::Ptr map_surf_cloud_;
+    double map_res_ = 0.2;
+
+
 public:
     IMUProcess()=default;
-    IMUProcess(const ModelParam& model_param) : model_param_(model_param){}
+    IMUProcess(const ModelParam& model_param) : model_param_(model_param){
+        map_surf_cloud_ = boost::make_shared<PointCloud>();
+        state_last_ = StateEKF();
+    }
 
 private:
     void forward_propagation(MeasureData& measure){
@@ -216,7 +230,6 @@ private:
         state_curr.time = measure.imu_queue.back().time; // measure.pcl_end_time;
         state_bp_queue_.clear();
         state_bp_queue_.push_back(state_curr);
-
         
         for(int i = size - 1; i > 0; i--){
             double dt = state_curr.time - measure.imu_queue[i - 1].time;
@@ -233,23 +246,23 @@ private:
         state_bp_queue_.push_back(state_last_);
     }
 
-    void point_cloud_undistort(MeasureData& measure, PointCloud& pcl_in, PointCloud& pcl_out){
-
-        pcl_out = pcl_in;
+    void point_cloud_undistort(MeasureData& measure, PointCloud::Ptr& pcl_in, PointCloud::Ptr& pcl_out){
 
         // 将每一点投影到扫描结束时刻的惯导坐标系下    
         int idx = 0;
-        for(int i = pcl_in.size(); i >= 0; i--){
-            auto& point_curr = pcl_in[i];
-            double time_interval = 0.1;
+        for(int i = pcl_in->size() - 1; i >= 0; i--){
+            auto& point_curr = (*pcl_in)[i];
+            double time_interval = map_res_;
             double time_curr_point = measure.pcl_beg_time + point_curr.curvature * time_interval;
 
             if(time_curr_point > state_bp_queue_[idx].time){
-                V3D p_l_i(pcl_out[i].x, pcl_out[i].y, pcl_out[i].z);
+                V3D p_l_i((*pcl_in)[i].x, (*pcl_in)[i].y, (*pcl_in)[i].z);
                 V3D p_b_i = model_param_.R_L_I * p_l_i + model_param_.T_L_I; // 转换到惯导坐标系下
-                pcl_out[i].x = p_b_i.x();
-                pcl_out[i].y = p_b_i.y();
-                pcl_out[i].z = p_b_i.z();
+                auto p = (*pcl_in)[i];
+                p.x = p_b_i.x();
+                p.y = p_b_i.y();
+                p.z = p_b_i.z();
+                pcl_out->push_back(p);
                 continue;
             }
             while(time_curr_point < state_bp_queue_[idx + 1].time){
@@ -264,12 +277,15 @@ private:
                 state_curr.rot = QD(R);            
                 state_curr.vel -= (state_curr.rot * imu.accel_mpss - state_curr.grav) * dt;
                 state_curr.pos -= state_curr.vel * dt;
-                V3D p_l_i(pcl_out[i].x, pcl_out[i].y, pcl_out[i].z);
+
+                V3D p_l_i((*pcl_in)[i].x, (*pcl_in)[i].y, (*pcl_in)[i].z);
                 V3D p_b_i = model_param_.R_L_I * p_l_i + model_param_.T_L_I; // 转换到惯导坐标系下
                 V3D p_b_end = state_curr.rot * p_l_i + state_curr.pos;      // 转换到扫描结束时刻的惯导坐标系下
-                pcl_out[i].x = p_b_end.x();
-                pcl_out[i].y = p_b_end.y();
-                pcl_out[i].z = p_b_end.z();
+                auto p = (*pcl_in)[i];
+                p.x = p_b_end.x();
+                p.y = p_b_end.y();
+                p.z = p_b_end.z();
+                pcl_out->push_back(p);
 
                 // std::cout << "p_b_end: " << p_b_end.transpose() << std::endl;
             }
@@ -279,7 +295,7 @@ private:
         // std::cout << "----------------------------------------------------" << std::endl;
     }
 
-    void update(MeasureData& measure, PointCloud& pcl_features){
+    void update(MeasureData& measure, PointCloud::Ptr& pcl_features){
         auto state_curr = state_queue_.back();
         Eigen::Matrix<double, 6, 6> Hmat = Eigen::Matrix<double, 6, 6>::Zero();
         for(int iter = 0; iter < 10; iter++){
@@ -289,14 +305,48 @@ private:
     }
 
 public:
+    bool init_imu(MeasureData& measure){
+        static int cnt = 0;
+        for(auto& imu : measure.imu_queue){
+            state_last_.ba += imu.accel_mpss;
+            state_last_.bg += imu.gyro_rps;
+            cnt++;
+        }
+        if(cnt > 2000){
+            state_last_.grav << 0, 0, -9.7936;
+            state_last_.bg /= cnt;
+            state_last_.ba /= cnt;
+            state_last_.ba -= state_last_.grav;
+            cnt = 0;
+            return true;
+        }
+        return false;
+    }
  
     void process(MeasureData& measure){
+
+        // 特征提取
+        ScanRegistration scan_registration;
+        scan_registration.feature_extract(measure.cloud);
+        auto& cloud_surf = scan_registration.pointSurf;
+
+
         if(!is_initialized_){
-            is_initialized_ = true;
-            state_last_ = StateEKF();
-            state_last_.grav = V3D(0, 0, -9.8);
-            state_last_.time = measure.imu_queue.back().time;
-            state_queue_.clear();
+            surf_cloud_queue_.push_back(cloud_surf);
+            *map_surf_cloud_ += *cloud_surf;
+
+            PointCloudXYZI::Ptr surf_filtered(new PointCloudXYZI);
+            pcl::VoxelGrid<PointType> sor;
+            sor.setInputCloud(map_surf_cloud_);
+            sor.setLeafSize(map_res_, map_res_, map_res_);
+            sor.filter(*surf_filtered);
+            map_surf_cloud_ = surf_filtered;
+
+            if(map_surf_cloud_->size() > 1000 && init_imu(measure)){
+                is_initialized_ = true;
+                state_last_.time = measure.imu_queue.back().time;
+                state_queue_.clear();
+            }
             return;
         }
 
@@ -311,29 +361,48 @@ public:
         // 反向传播
         backward_propagation(measure);
 
-        // 特征提取
-        ScanRegistration scan_registration;
-        scan_registration.feature_extract(*measure.cloud);
-        auto& cloud_surf = scan_registration.pointSurf;
-
         // 点云运动补偿
-        PointCloud pcl_out;
+        PointCloud::Ptr pcl_out = boost::make_shared<PointCloud>();
         point_cloud_undistort(measure, cloud_surf, pcl_out);
 
         // 点云迭代更新
         update(measure, pcl_out);
 
         // 误差状态修正
-
         delta_x_ = Eigen::Matrix<double, N, 1>::Zero();
+
+        // 地图增量更新
+        PointCloud::Ptr cloud_surf_w = boost::make_shared<PointCloud>();
+        cloud_surf_w->resize(pcl_out->size());
+        for(int i = 0; i < pcl_out->size(); i++){
+            V3D pb((*pcl_out)[i].x, (*pcl_out)[i].y, (*pcl_out)[i].z);
+            V3D pl = state_last_.rot * pb + state_last_.pos; // 转换到世界坐标系下
+            (*cloud_surf_w)[i].x = pl.x();
+            (*cloud_surf_w)[i].y = pl.y();
+            (*cloud_surf_w)[i].z = pl.z();
+        }
+        surf_cloud_queue_.push_back(cloud_surf_w);
+        map_surf_cloud_->clear();
+        for(auto& cloud : surf_cloud_queue_){
+            *map_surf_cloud_ += *cloud;
+        }
+        PointCloudXYZI::Ptr surf_filtered(new PointCloudXYZI);
+        pcl::VoxelGrid<PointType> sor;
+        sor.setInputCloud(map_surf_cloud_);
+        sor.setLeafSize(map_res_, map_res_, map_res_);
+        sor.filter(*surf_filtered);
+        map_surf_cloud_ = surf_filtered;
+        if (map_surf_cloud_->size() > 16000)
+            surf_cloud_queue_.erase(surf_cloud_queue_.begin());
+
+
 
         if(1){
             state_last_ = state_queue_.back();
             state_queue_.clear();
-
             auto euler = SO3Math::quat2euler(state_last_.rot);
             euler = euler * 180 / M_PI;
-            // std::cout << "time: " << state_last_.time << " euler: " << euler.transpose()<< std::endl;
+            std::cout << "time: " << state_last_.time << " euler: " << euler.transpose()<< std::endl;
         }
     }
 
