@@ -22,12 +22,12 @@ int main(int argc, char** argv)
     {
         double imu_time = msg->header.stamp.toSec();
         if(meas.cloud == nullptr || imu_time <= meas.pcl_end_time){
-            auto&& acc = msg->linear_acceleration;
-            auto&& gyro = msg->angular_velocity;
+            auto&& accel_mpss = msg->linear_acceleration;
+            auto&& gyro_rps = msg->angular_velocity;
             ImuData imu;
             imu.time = msg->header.stamp.toSec();
-            imu.acc << acc.x, acc.y, acc.z;
-            imu.gyro << gyro.x, gyro.y, gyro.z;
+            imu.accel_mpss << accel_mpss.x, accel_mpss.y, accel_mpss.z;
+            imu.gyro_rps << gyro_rps.x, gyro_rps.y, gyro_rps.z;
             meas.imu_queue.push(imu);
         }
     });
@@ -48,7 +48,15 @@ int main(int argc, char** argv)
 
     ROS_INFO("imu_process start");
 
-    IMUProcess imu_process;
+    ModelParam model_param;
+    model_param.ARW                  = 0.1 / 60.0 * SO3Math::D2R;    // deg/sqrt(hr)
+    model_param.VRW                  = 0.1 / 60.0;          // m/s/sqrt(hr)
+    model_param.gyro_bias_std        = 50 * SO3Math::D2R / 3600.0;   // deg/hr
+    model_param.gyro_bias_corr_time  = 1 * 3600.0;
+    model_param.accel_bias_std       = 50 * 1e-5;           // mGal 1mGal=1e-5Gal
+    model_param.accel_bias_corr_time = 1 * 3600.0;
+
+    IMUProcess imu_process(model_param);
 
     while(ros::ok()){
         if(!measure_queue.empty()){

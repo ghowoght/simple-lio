@@ -20,6 +20,8 @@
 
 #include "so3_math.hpp"
 
+#define N 18
+
 typedef pcl::PointXYZINormal PointType;
 typedef pcl::PointCloud<PointType> PointCloud;
 typedef Eigen::Vector3d V3D;
@@ -65,21 +67,21 @@ struct StateEKF{
 
 struct ImuData{
     double time;
-    Eigen::Vector3d acc;
-    Eigen::Vector3d gyro;
+    Eigen::Vector3d accel_mpss;
+    Eigen::Vector3d gyro_rps;
     ImuData(){
-        acc = Eigen::Vector3d::Zero();
-        gyro = Eigen::Vector3d::Zero();
+        accel_mpss = Eigen::Vector3d::Zero();
+        gyro_rps = Eigen::Vector3d::Zero();
         time = 0;
     }
-    ImuData(double time_, Eigen::Vector3d acc_, Eigen::Vector3d gyro_){
+    ImuData(double time_, Eigen::Vector3d accel_mpss_, Eigen::Vector3d gyro_rps_){
         time = time_;
-        acc = acc_;
-        gyro = gyro_;
+        accel_mpss = accel_mpss_;
+        gyro_rps = gyro_rps_;
     }
     ImuData(const ImuData& other){
-        acc = other.acc;
-        gyro = other.gyro;
+        accel_mpss = other.accel_mpss;
+        gyro_rps = other.gyro_rps;
         time = other.time;
     }
 };
@@ -93,13 +95,33 @@ struct MeasureData{
     
 };
 
+struct ModelParam{
+    double ARW;                             // 角度随机游走
+    double VRW;                             // 速度随机游走
+    double gyro_bias_std;                   // 陀螺仪零偏标准差
+    double gyro_bias_corr_time;             // 陀螺仪零偏相关时间
+    double accel_bias_std;                  // 加速度计零偏标准差
+    double accel_bias_corr_time;            // 加速度计零偏相关时间
+};
+
 class IMUProcess{
 private:
-    Eigen::Matrix<double, 18, 1> delta_x_; // p v phi bg ba g
-    Eigen::Matrix<double, 18, 18> P_;
+
     StateEKF state_last_;
     std::vector<StateEKF> state_queue_;
     bool is_initialized_ = false;
+    ModelParam model_param_;
+
+    // kalman相关
+    Eigen::Matrix<double, N, 1> delta_x_; // p v phi bg ba g
+    Eigen::Matrix<double, N, N> Pmat_;
+
+    Eigen::Matrix<double, N, 12> Gmat_; // 噪声输入映射矩阵 noise-input mapping matrix
+    Eigen::Matrix<double, N, 12> Gmat_last_;
+
+public:
+    IMUProcess()=default;
+    IMUProcess(const ModelParam& model_param) : model_param_(model_param){}
 
 private:
     void forward_propagation(MeasureData& measure){
@@ -114,18 +136,57 @@ private:
 
             double dt = imu.time - state_curr.time;
             state_curr.time = imu.time;
-            ROS_INFO("dt = %f", dt);
+
+            //////////////// 机械编排 ////////////////
             // 姿态更新
-            M3D R = state_curr.rot.toRotationMatrix() * SO3Math::Exp(imu.gyro * dt);
+            M3D R = state_curr.rot.toRotationMatrix() * SO3Math::Exp(imu.gyro_rps * dt);
             state_curr.rot = QD(R);            
             // 速度更新
-            state_curr.vel += (state_curr.rot * imu.acc - state_curr.grav) * dt;
+            state_curr.vel += (state_curr.rot * imu.accel_mpss - state_curr.grav) * dt;
             // 位置更新
             state_curr.pos += state_curr.vel * dt;
 
             state_queue_.push_back(state_curr);
 
-            
+            //////////////// 噪声传播 ////////////////
+            auto I_33 = Eigen::Matrix3d::Identity();
+            // 计算状态转移矩阵Φ
+            Eigen::Matrix<double, N, N> PHImat = Eigen::Matrix<double, N, N>::Identity();
+            // p
+            PHImat.block<3, 3>(0,  3) = I_33 * dt;  
+            // v
+            PHImat.block<3, 3>(3,  6) = SO3Math::get_skew_symmetric(state_curr.rot * imu.accel_mpss) * dt; 
+            PHImat.block<3, 3>(3, 12) = state_curr.rot.toRotationMatrix() * dt;
+            PHImat.block<3, 3>(3, 15) = I_33 * dt;
+            // phi
+            PHImat.block<3, 3>(6,  6) = I_33 - SO3Math::get_skew_symmetric(imu.gyro_rps) * dt; // SO3Math::Exp(-imu.gyro_rps * dt)
+            PHImat.block<3, 3>(6,  9) = -state_curr.rot.toRotationMatrix() * dt;
+
+            // 计算状态转移噪声协方差矩阵Q
+            Eigen::Matrix<double, 12, 12> qmat = Eigen::Matrix<double, 12, 12>::Zero();
+            double item[] = {   model_param_.VRW * model_param_.VRW,
+                                model_param_.ARW * model_param_.ARW,
+                                2 * model_param_.gyro_bias_std * model_param_.gyro_bias_std / model_param_.gyro_bias_corr_time,
+                                2 * model_param_.accel_bias_std * model_param_.accel_bias_std / model_param_.accel_bias_corr_time,
+                            };
+            Eigen::Matrix3d mat[4];
+            for(int i = 0; i < 4; i++){
+                mat[i] = Eigen::Vector3d(item[i], item[i], item[i]).asDiagonal();
+                qmat.block<3, 3>(3 * i,  3 * i) = mat[i];
+            }
+            Gmat_ = Eigen::Matrix<double, N, 12>::Zero();
+            Gmat_.block<3, 3>( 3, 0) = state_curr.rot.toRotationMatrix();
+            Gmat_.block<3, 3>( 6, 3) = state_curr.rot.toRotationMatrix();
+            Gmat_.block<3, 3>( 9, 6) = I_33;
+            Gmat_.block<3, 3>(12, 9) = I_33;
+            // 梯形积分
+            auto Qmat = 0.5 * (PHImat * Gmat_last_ * qmat * Gmat_last_.transpose() * PHImat.transpose()
+                        + Gmat_ * qmat * Gmat_.transpose()) * dt;
+            Gmat_last_ = Gmat_;
+
+            // 状态转移
+            delta_x_ = PHImat * delta_x_;
+            Pmat_ = PHImat * Pmat_ * PHImat.transpose() + Qmat;
         }
 
         if(1){
@@ -139,8 +200,12 @@ private:
     }
     void backward_propagation();
 
+    void point_cloud_undistort(MeasureData& measure){
+        
+    }
+
 public:
-    void point_cloud_undistort();
+
     void process(MeasureData& measure){
         if(!is_initialized_){
             is_initialized_ = true;
@@ -152,6 +217,9 @@ public:
 
         // 前向传播
         forward_propagation(measure);
+
+        // 点云运动补偿
+        point_cloud_undistort(measure);
     }
 
 };

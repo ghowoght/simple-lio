@@ -16,6 +16,8 @@
 
 class SO3Math{
 public:
+    constexpr static double D2R = M_PI / 180.0;
+    constexpr static double R2D = 180.0 / M_PI;
     // 反对称矩阵
     static Eigen::Matrix3d get_skew_symmetric(const Eigen::Vector3d& v)
     {
