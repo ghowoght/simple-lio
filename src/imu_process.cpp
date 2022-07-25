@@ -28,7 +28,7 @@ int main(int argc, char** argv)
             imu.time = msg->header.stamp.toSec();
             imu.accel_mpss << accel_mpss.x, accel_mpss.y, accel_mpss.z;
             imu.gyro_rps << gyro_rps.x, gyro_rps.y, gyro_rps.z;
-            meas.imu_queue.push(imu);
+            meas.imu_queue.push_back(imu);
         }
     });
 
@@ -39,7 +39,7 @@ int main(int argc, char** argv)
         meas.pcl_beg_time = msg->header.stamp.toSec();
         meas.pcl_end_time = msg->header.stamp.toSec() + 0.1;
         while(meas.imu_queue.front().time < meas.pcl_beg_time){
-            meas.imu_queue.pop();
+            meas.imu_queue.erase(meas.imu_queue.begin());
         }
         measure_queue.push(meas); // 将数据打包到队列中
         meas.cloud = nullptr;

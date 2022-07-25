@@ -19,6 +19,7 @@
 #include <queue>
 
 #include "so3_math.hpp"
+#include "scan_registration.hpp"
 
 #define N 18
 
@@ -88,7 +89,7 @@ struct ImuData{
 
 // IMU 和 点云 数据打包
 struct MeasureData{
-    std::queue<ImuData> imu_queue;
+    std::vector<ImuData> imu_queue;
     PointCloud::Ptr cloud;
     double pcl_beg_time;
     double pcl_end_time;
@@ -109,6 +110,7 @@ private:
 
     StateEKF state_last_;
     std::vector<StateEKF> state_queue_;
+    std::vector<StateEKF> state_bp_queue_;
     bool is_initialized_ = false;
     ModelParam model_param_;
 
@@ -130,8 +132,7 @@ private:
         }
         auto size = measure.imu_queue.size();
         for(int i = 0; i < size; i++){
-            auto imu = measure.imu_queue.front();
-            measure.imu_queue.pop();
+            auto imu = measure.imu_queue[i];
             StateEKF state_curr = state_queue_.back();
 
             double dt = imu.time - state_curr.time;
@@ -189,19 +190,50 @@ private:
             Pmat_ = PHImat * Pmat_ * PHImat.transpose() + Qmat;
         }
 
-        if(1){
-            state_last_ = state_queue_.back();
-            state_queue_.clear();
-
-            auto euler = SO3Math::quat2euler(state_last_.rot);
-            euler = euler * 180 / M_PI;
-            std::cout << "time: " << state_last_.time << " euler: " << euler.transpose()<< std::endl;
-        }
+        
     }
-    void backward_propagation();
+    void backward_propagation(MeasureData& measure){
+        auto size = measure.imu_queue.size();
+
+        StateEKF state_curr;
+        state_curr.time = measure.pcl_end_time;
+        state_bp_queue_.clear();
+        state_bp_queue_.push_back(state_curr);
+
+        
+        for(int i = 0; i < size; i++){
+            auto imu = measure.imu_queue[size - 1 - i];
+
+            double dt = state_curr.time - imu.time;
+            // 姿态更新
+            M3D R = state_curr.rot.toRotationMatrix() * SO3Math::Exp(-imu.gyro_rps * dt);
+            state_curr.rot = QD(R);            
+            // 速度更新
+            state_curr.vel -= (state_curr.rot * imu.accel_mpss - state_curr.grav) * dt;
+            // 位置更新
+            state_curr.pos -= state_curr.vel * dt;
+
+            state_bp_queue_.push_back(state_curr);
+        }
+        state_bp_queue_.push_back(state_last_);
+    }
 
     void point_cloud_undistort(MeasureData& measure){
-        
+        // 根据每一点的
+        auto ptr = measure.cloud;
+        auto&& cloud = *ptr;
+
+        // 特征提取
+        ScanRegistration scan_registration;
+        scan_registration.feature_extract(cloud);
+
+        auto& cloud_surf = scan_registration.pointSurf;
+
+        // 将每一点投影到扫描结束时刻的惯导坐标系下    
+        for(int i = 0; i < cloud_surf.size(); i++){
+            // std::cout << "curvature: " << cloud_surf[i].curvature << std::endl;
+
+        }
     }
 
 public:
@@ -218,8 +250,20 @@ public:
         // 前向传播
         forward_propagation(measure);
 
+        // 反向传播
+        backward_propagation(measure);
+
         // 点云运动补偿
         point_cloud_undistort(measure);
+
+        if(1){
+            state_last_ = state_queue_.back();
+            state_queue_.clear();
+
+            auto euler = SO3Math::quat2euler(state_last_.rot);
+            euler = euler * 180 / M_PI;
+            // std::cout << "time: " << state_last_.time << " euler: " << euler.transpose()<< std::endl;
+        }
     }
 
 };
