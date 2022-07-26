@@ -179,7 +179,10 @@ public:
         // M3D ab = Eigen::Vector3d(model_param.accel_bias_std * model_param.accel_bias_std, 
         //                         model_param.accel_bias_std * model_param.accel_bias_std, 
         //                         model_param.accel_bias_std * model_param.accel_bias_std).asDiagonal();
-        Pmat_ = Eigen::Matrix<double, N, N>::Identity() * 0.01;
+        Pmat_ = Eigen::Matrix<double, N, N>::Identity();
+        Pmat_(6,6) = Pmat_(7,7) = Pmat_(8,8) = 0.00001;
+        Pmat_(9,9) = Pmat_(10,10) = Pmat_(11,11) = 0.00001;
+        Pmat_(15,15) = Pmat_(16,16) = Pmat_(17,17) = 0.00001;
         // Pmat_.block<3, 3>(9, 9) = gb;
         // Pmat_.block<3, 3>(12, 12) = ab;
     }
@@ -213,15 +216,25 @@ private:
             auto I_33 = Eigen::Matrix3d::Identity();
             // 计算状态转移矩阵Φ
             Eigen::Matrix<double, N, N> PHImat = Eigen::Matrix<double, N, N>::Identity();
+            // // p
+            // PHImat.block<3, 3>(0,  3) = I_33 * dt;  
+            // // v
+            // PHImat.block<3, 3>(3,  6) = SO3Math::get_skew_symmetric(state_curr.rot * imu.accel_mpss) * dt; 
+            // PHImat.block<3, 3>(3, 12) = state_curr.rot.toRotationMatrix() * dt;
+            // PHImat.block<3, 3>(3, 15) = I_33 * dt;
+            // // phi
+            // PHImat.block<3, 3>(6,  6) = I_33 - SO3Math::get_skew_symmetric(imu.gyro_rps) * dt; // SO3Math::Exp(-imu.gyro_rps * dt)
+            // PHImat.block<3, 3>(6,  9) = -state_curr.rot.toRotationMatrix() * dt;
+
             // p
             PHImat.block<3, 3>(0,  3) = I_33 * dt;  
             // v
-            PHImat.block<3, 3>(3,  6) = SO3Math::get_skew_symmetric(state_curr.rot * imu.accel_mpss) * dt; 
-            PHImat.block<3, 3>(3, 12) = state_curr.rot.toRotationMatrix() * dt;
+            PHImat.block<3, 3>(3,  6) = -SO3Math::get_skew_symmetric(state_curr.rot * imu.accel_mpss) * dt; 
+            PHImat.block<3, 3>(3, 12) = -state_curr.rot.toRotationMatrix() * dt;
             PHImat.block<3, 3>(3, 15) = I_33 * dt;
             // phi
-            PHImat.block<3, 3>(6,  6) = I_33 - SO3Math::get_skew_symmetric(imu.gyro_rps) * dt; // SO3Math::Exp(-imu.gyro_rps * dt)
-            PHImat.block<3, 3>(6,  9) = -state_curr.rot.toRotationMatrix() * dt;
+            PHImat.block<3, 3>(6,  6) = SO3Math::Exp(-imu.gyro_rps * dt);
+            PHImat.block<3, 3>(6,  9) = -SO3Math::J_l(imu.gyro_rps * dt).transpose() * dt;
 
             // 计算状态转移噪声协方差矩阵Q
             Eigen::Matrix<double, 12, 12> qmat = Eigen::Matrix<double, 12, 12>::Zero();
@@ -236,14 +249,20 @@ private:
                 qmat.block<3, 3>(3 * i,  3 * i) = mat[i];
             }
             Gmat_ = Eigen::Matrix<double, N, 12>::Zero();
-            Gmat_.block<3, 3>( 3, 0) = state_curr.rot.toRotationMatrix();
-            Gmat_.block<3, 3>( 6, 3) = state_curr.rot.toRotationMatrix();
-            Gmat_.block<3, 3>( 9, 6) = I_33;
-            Gmat_.block<3, 3>(12, 9) = I_33;
+            // Gmat_.block<3, 3>( 3, 0) = state_curr.rot.toRotationMatrix();
+            // Gmat_.block<3, 3>( 6, 3) = state_curr.rot.toRotationMatrix();
+            // Gmat_.block<3, 3>( 9, 6) = I_33;
+            // Gmat_.block<3, 3>(12, 9) = I_33;
+            
             // 梯形积分
-            auto Qmat = 0.5 * (PHImat * Gmat_last_ * qmat * Gmat_last_.transpose() * PHImat.transpose()
-                        + Gmat_ * qmat * Gmat_.transpose()) * dt;
-            Gmat_last_ = Gmat_;
+            // auto Qmat = 0.5 * (PHImat * Gmat_last_ * qmat * Gmat_last_.transpose() * PHImat.transpose()
+            //             + Gmat_ * qmat * Gmat_.transpose()) * dt;
+            // Gmat_last_ = Gmat_;
+            Gmat_.block<3, 3>( 3, 0) = -state_curr.rot.toRotationMatrix() * dt;
+            Gmat_.block<3, 3>( 6, 3) = -SO3Math::J_l(imu.gyro_rps * dt).transpose() * dt;
+            Gmat_.block<3, 3>( 9, 6) = I_33 * dt;
+            Gmat_.block<3, 3>(12, 9) = I_33 * dt;
+            auto Qmat = Gmat_ * qmat * Gmat_.transpose();
 
             // 状态转移
             delta_x_ = PHImat * delta_x_;
@@ -379,18 +398,29 @@ private:
                     // 最近邻在一个平面上
                     if (eigenValues_sort[1] > 3 * eigenValues_sort[0])
                     {
-                        Eigen::Vector3d lpj{nearest[0].x, nearest[0].y, nearest[0].z};
-                        Eigen::Vector3d lpl{nearest[4].x, nearest[4].y, nearest[4].z};
-                        Eigen::Vector3d lpm{nearest[7].x, nearest[7].y, nearest[7].z};
-                        // 计算jlm的归一化法向量
-                        V3D ljm = (lpj - lpl).cross(lpj - lpm);
-                        ljm.normalize();
+                        Eigen::Matrix<double, 8, 3> A = Eigen::Matrix<double, 8, 3>::Zero();
+                        Eigen::Matrix<double, 8, 1> b = Eigen::Matrix<double, 8, 1>::Ones() * (-1.0);
+                        for(int k = 0; k < 8; k++){
+                            A(k, 0) = nearest[k].x;
+                            A(k, 1) = nearest[k].y;
+                            A(k, 2) = nearest[k].z;
+                        }
+                        V3D normvec = A.colPivHouseholderQr().solve(b); // 求解法向量
+                        double norm = normvec.norm();
+                        normvec.normalize();
+
+                        Eigen::Vector4d abcd;
+                        abcd(0) = normvec(0);
+                        abcd(1) = normvec(1);
+                        abcd(2) = normvec(2);
+                        abcd(3) = 1 / norm;
+
                         // 计算点到平面的距离
-                        double res = (wp - lpj).dot(ljm);
+                        double res = abcd(0) * wp.x() + abcd(1) * wp.y() + abcd(2) * wp.z() + abcd(3);
                         // 判断是否为有效点
                         double s = 1 - 0.9 * fabs(res) / sqrt(cp.norm());
                         if(s > 0.9)
-                            effect_feature_queue.push_back(EffectFeature{cp, ljm, res});
+                            effect_feature_queue.push_back(EffectFeature{cp, normvec, res});
                     }
                 }
             }
@@ -403,7 +433,7 @@ private:
                 delta_z_(i) = ef.res;
             }
 
-            double R = 0.001;
+            double R = 0.0025;
             Eigen::Matrix<double, Eigen::Dynamic, Eigen::Dynamic> Rmat 
                 = Eigen::MatrixXd::Identity(effect_feature_queue.size(), effect_feature_queue.size()) * R;
             Eigen::Matrix<double, Eigen::Dynamic, Eigen::Dynamic> Rmat_inv 
@@ -442,12 +472,11 @@ private:
             state_curr_iter.rot = state_last_iter.rot.toRotationMatrix() * SO3Math::Exp(delta.block<3, 1>( 6, 0));
             state_curr_iter.bg = state_last_iter.bg + delta.block<3, 1>( 9, 0);
             state_curr_iter.ba = state_last_iter.ba + delta.block<3, 1>(12, 0);
+            // state_curr_iter.grav = state_last_iter.grav + delta.block<3, 1>(15, 0);
             state_last_iter = state_curr_iter;
         }
         state_last_ = state_curr_iter;
-        std::cout << "state_last_.grav: " << state_last_.grav.transpose() << std::endl;
         Pmat_ = (Eigen::Matrix<double, N, N>::Identity() - Kmat_ * Hmat_) * Pmat_;
-        
     }
 
 public:
