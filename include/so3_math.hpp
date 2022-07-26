@@ -40,9 +40,10 @@ public:
     static Eigen::Matrix3d Exp(const Eigen::Vector3d& r){
         Eigen::Matrix3d expr;
         double theta = r.norm();
-        if(theta < 1e-8){
+        if(theta < 1e-7){
             expr = Eigen::Matrix3d::Identity();
-        }else{
+        }
+        else{
             Eigen::Matrix3d skew = get_skew_symmetric(r / theta);
             expr = Eigen::Matrix3d::Identity() + sin(theta) * skew + (1 - cos(theta)) * skew * skew;
         }
@@ -50,9 +51,9 @@ public:
     }
 
     static Eigen::Vector3d Log(const Eigen::Matrix3d& R){
-        double theta = acos((R.trace() - 1) / 2);
-        Eigen::Vector3d r(R(1, 0) - R(0, 1), R(0, 2) - R(2, 0), R(1, 2) - R(2, 1));
-        return fabs(theta) < 0.001 ? (0.5 * r) : (0.5 / sin(theta) * r);
+        double theta = (R.trace() > 3 - 1e-6) ? 0 : acos((R.trace() - 1) / 2);
+        Eigen::Vector3d r(R(2,1) - R(1,2), R(0,2) - R(2,0), R(1,0) - R(0,1));
+        return fabs(theta) < 0.001 ? (0.5 * r) : (0.5 * theta / sin(theta) * r);
     }   
     static Eigen::Matrix3d J_l(const Eigen::Vector3d& r){
         Eigen::Matrix3d A;
