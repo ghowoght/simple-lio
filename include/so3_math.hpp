@@ -59,7 +59,7 @@ public:
         double theta = r.norm();
         Eigen::Vector3d ang = r / theta;
         Eigen::Matrix3d skew = get_skew_symmetric(ang);
-        if(theta > 0.001){
+        if(theta > 1e-11){
             A = Eigen::Matrix3d::Identity() - (1 - cos(theta)) / theta * skew
                     + (1 - sin(theta) / theta) * skew * skew;
         }
@@ -73,8 +73,13 @@ public:
         double theta = r.norm();
         double half_theta = theta * 0.5;
         Eigen::Matrix3d skew = get_skew_symmetric(r);
-        A_inv = Eigen::Matrix3d::Identity() - 0.5 * skew
-            + (1 - half_theta * cos(half_theta) / sin(half_theta)) * skew * skew / theta / theta;
+
+        if(theta > 1e-11){
+            A_inv = Eigen::Matrix3d::Identity() - 0.5 * skew
+                + (1 - half_theta * cos(half_theta) / sin(half_theta)) * skew * skew / theta / theta;
+        }
+        else
+            A_inv = Eigen::Matrix3d::Identity();
         return A_inv;
     }
 
