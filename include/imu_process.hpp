@@ -26,6 +26,10 @@
 #include "so3_math.hpp"
 #include "scan_registration.hpp"
 
+#include <ros/ros.h>
+#include <nav_msgs/Path.h>
+#include <tf/transform_broadcaster.h>
+
 #define N 18
 
 typedef pcl::PointXYZINormal PointType;
@@ -115,6 +119,9 @@ struct ModelParam{
         R_L_I.z()=cos(pitch/2)*sin(yaw/2)*cos(roll/2)-sin(pitch/2)*cos(yaw/2)*sin(roll/2);
         R_L_I.w()=cos(pitch/2)*cos(yaw/2)*cos(roll/2)-sin(pitch/2)*sin(yaw/2)*sin(roll/2);
     }
+    void init_r_l_i(M3D& R_L_I_){
+        R_L_I = QD(R_L_I_);
+    }
     void init_t_l_i(double x, double y, double z){
         T_L_I(0) = x;
         T_L_I(1) = y;
@@ -124,6 +131,13 @@ struct ModelParam{
 
 class IMUProcess{
 private:
+
+    ros::NodeHandle nh_;
+    ros::Publisher pub_surf_map;
+    ros::Publisher pub_traj;
+    tf::TransformBroadcaster odom_broadcaster;
+    geometry_msgs::TransformStamped odom_trans;
+    nav_msgs::Path traj_local_msgs;
 
     StateEKF state_last_;
     std::vector<StateEKF> state_queue_;
@@ -151,7 +165,12 @@ private:
 
 public:
     IMUProcess()=default;
-    IMUProcess(const ModelParam& model_param) : model_param_(model_param){
+    IMUProcess(const ModelParam& model_param, ros::NodeHandle& nh) : model_param_(model_param), nh_(nh){
+
+        pub_surf_map = nh_.advertise<sensor_msgs::PointCloud2>("/surf_map", 1);
+        pub_traj     = nh_.advertise<nav_msgs::Path>("/traj/local", 10);
+
+
         map_surf_cloud_ = boost::make_shared<PointCloud>();
         state_last_ = StateEKF();
         // M3D gb = Eigen::Vector3d(model_param.gyro_bias_std * model_param.gyro_bias_std, 
@@ -167,6 +186,7 @@ public:
 
 private:
     void forward_propagation(MeasureData& measure){
+        state_queue_.clear();
         if(state_queue_.empty()){
             state_queue_.push_back(state_last_);
         }
@@ -293,7 +313,7 @@ private:
 
                 V3D p_l_i((*pcl_in)[i].x, (*pcl_in)[i].y, (*pcl_in)[i].z);
                 V3D p_b_i = model_param_.R_L_I * p_l_i + model_param_.T_L_I; // 转换到惯导坐标系下
-                V3D p_b_end = state_curr.rot * p_l_i + state_curr.pos;      // 转换到扫描结束时刻的惯导坐标系下
+                V3D p_b_end = state_curr.rot * p_b_i + state_curr.pos;      // 转换到扫描结束时刻的惯导坐标系下
                 auto p = (*pcl_in)[i];
                 p.x = p_b_end.x();
                 p.y = p_b_end.y();
@@ -308,13 +328,11 @@ private:
     }
 
     struct EffectFeature{
-        V3D pb;          // 点的I系坐标
-        V3D norm_vec; // 法向量
-        double res;      // 残差
+        V3D pb;         // 点的I系坐标
+        V3D norm_vec;   // 法向量
+        double res;     // 残差
     };
-    int cnt_ = 0;
     void iterate_update(MeasureData& measure, PointCloud::Ptr& pcl_features){
-        cnt_++;
         // ROS_INFO("map_surf_cloud: %d", map_surf_cloud_->size());
         kdtree_.setInputCloud(map_surf_cloud_);
         // KD-Tree最近邻搜索结果的索引和距离
@@ -344,8 +362,7 @@ private:
                 if (pointSearchSqDis[7] < 5){
                     // 计算质心和协方差
                     PointCloudXYZI nearest;
-                    for (int k = 0; k < pointSearchInd.size(); k++)
-                    {
+                    for (int k = 0; k < pointSearchInd.size(); k++){
                         nearest.push_back((*map_surf_cloud_)[pointSearchInd[k]]);
                     }
                     Eigen::Vector4f centroid;   // 质心
@@ -386,7 +403,7 @@ private:
                 delta_z_(i) = ef.res;
             }
 
-            double R = 0.01;
+            double R = 0.001;
             Eigen::Matrix<double, Eigen::Dynamic, Eigen::Dynamic> Rmat 
                 = Eigen::MatrixXd::Identity(effect_feature_queue.size(), effect_feature_queue.size()) * R;
             Eigen::Matrix<double, Eigen::Dynamic, Eigen::Dynamic> Rmat_inv 
@@ -402,8 +419,8 @@ private:
             dx.block<3, 1>(15, 0) = state_curr_iter.grav - state_iter_0.grav;
 
             auto dx_new = dx;
-            if(cnt_ > 1)
-                std::cout << "dx: " << dx.transpose() << std::endl;
+            // if(cnt_ > 1)
+            //     std::cout << "dx: " << dx.transpose() << std::endl;
             
             auto Amat_inv = SO3Math::J_l_inv(dx.block<3, 1>( 6, 0));
             Jmat.block<3, 3>(6, 6) = Amat_inv.transpose();
@@ -413,29 +430,22 @@ private:
             // Pmat_.block<3, 3>(6, 6) = Amat.transpose() * Pmat_.block<3, 3>(6, 6) * Amat;
 
             // 卡尔曼增益
-            // Kmat_ = Pmat_ * Hmat_.transpose() * (Hmat_ * Pmat_ * Hmat_.transpose() + Rmat).inverse();
-            // Kmat_ = (Hmat_.transpose() * Rmat_inv * Hmat_ + Pmat_.inverse()).inverse() * Hmat_.transpose() * Rmat_inv;
-            // Kmat_ = (Hmat_.transpose() * Hmat_ / R).inverse() * Hmat_.transpose() / R;
-            // Kmat_ = (Pmat_.inverse()).inverse() * Hmat_.transpose() * Rmat_inv;
-
             Kmat_ = (Hmat_.transpose() * Hmat_ + (Pmat_ / R).inverse()).inverse() * Hmat_.transpose();
             // std::cout << "Kmat_: " << Kmat_ << std::endl;
 
             // 状态迭代
             dx_new.block<3, 1>(6, 0) = Amat.transpose() * dx_new.block<3, 1>(6, 0);
-            auto delta = Kmat_ * delta_z_ - (Eigen::Matrix<double, N, N>::Identity() - Kmat_ * Hmat_) * dx_new;
-
+            auto delta = -Kmat_ * delta_z_ - (Eigen::Matrix<double, N, N>::Identity() - Kmat_ * Hmat_) * dx_new;
             // std::cout << delta.transpose() << std::endl;
             state_curr_iter.pos = state_last_iter.pos + delta.block<3, 1>( 0, 0);
             state_curr_iter.vel = state_last_iter.vel + delta.block<3, 1>( 3, 0);
             state_curr_iter.rot = state_last_iter.rot.toRotationMatrix() * SO3Math::Exp(delta.block<3, 1>( 6, 0));
             state_curr_iter.bg = state_last_iter.bg + delta.block<3, 1>( 9, 0);
             state_curr_iter.ba = state_last_iter.ba + delta.block<3, 1>(12, 0);
-            // state_curr_iter.grav = state_last_iter.grav + delta.block<3, 1>(15, 0);
-
             state_last_iter = state_curr_iter;
         }
         state_last_ = state_curr_iter;
+        std::cout << "state_last_.grav: " << state_last_.grav.transpose() << std::endl;
         Pmat_ = (Eigen::Matrix<double, N, N>::Identity() - Kmat_ * Hmat_) * Pmat_;
         
     }
@@ -450,8 +460,8 @@ public:
         }
         if(cnt > 1000){
             state_last_.grav << 0, 0, -9.7936;
-            state_last_.bg /= cnt;
-            state_last_.ba /= cnt;
+            state_last_.bg /= (double)cnt;
+            state_last_.ba /= (double)cnt;
             state_last_.ba -= state_last_.grav;
             cnt = 0;
             return true;
@@ -466,8 +476,16 @@ public:
         scan_registration.feature_extract(measure.cloud);
         auto& cloud_surf = scan_registration.pointSurf;
 
-
         if(!is_initialized_){
+            // 转换到惯性系
+            for(int i = 0; i < cloud_surf->points.size(); i++){
+                auto& p = cloud_surf->points[i];
+                V3D pl = V3D(p.x, p.y, p.z);
+                V3D pb = model_param_.R_L_I * pl + model_param_.T_L_I;
+                p.x = pb.x();
+                p.y = pb.y();
+                p.z = pb.z();
+            }
             surf_cloud_queue_.push_back(cloud_surf);
             *map_surf_cloud_ += *cloud_surf;
 
@@ -485,7 +503,6 @@ public:
             }
             return;
         }
-
         // 原始数据补偿
         for(auto& imu : measure.imu_queue){
             imu.accel_mpss  -= state_last_.ba;
@@ -502,34 +519,67 @@ public:
         iterate_update(measure, pcl_out);
         // 误差状态修正
         delta_x_ = Eigen::Matrix<double, N, 1>::Zero();
-
         // 地图增量更新
-        PointCloud::Ptr cloud_surf_w = boost::make_shared<PointCloud>();
-        cloud_surf_w->resize(pcl_out->size());
-        for(int i = 0; i < pcl_out->size(); i++){
-            V3D pb((*pcl_out)[i].x, (*pcl_out)[i].y, (*pcl_out)[i].z);
-            V3D pl = state_last_.rot * pb + state_last_.pos; // 转换到世界坐标系下
-            (*cloud_surf_w)[i].x = pl.x();
-            (*cloud_surf_w)[i].y = pl.y();
-            (*cloud_surf_w)[i].z = pl.z();
+        if(1){
+            PointCloud::Ptr cloud_surf_w = boost::make_shared<PointCloud>();
+            cloud_surf_w->resize(pcl_out->size());
+            for(int i = 0; i < pcl_out->size(); i++){
+                V3D pb((*pcl_out)[i].x, (*pcl_out)[i].y, (*pcl_out)[i].z);
+                V3D pw = state_last_.rot * pb + state_last_.pos; // 转换到世界坐标系下
+                (*cloud_surf_w)[i].x = pw.x();
+                (*cloud_surf_w)[i].y = pw.y();
+                (*cloud_surf_w)[i].z = pw.z();
+            }
+            surf_cloud_queue_.push_back(cloud_surf_w);
+            map_surf_cloud_->clear();
+            for(auto& cloud : surf_cloud_queue_){
+                *map_surf_cloud_ += *cloud;
+            }
+            PointCloudXYZI::Ptr surf_filtered(new PointCloudXYZI);
+            pcl::VoxelGrid<PointType> sor;
+            sor.setInputCloud(map_surf_cloud_);
+            sor.setLeafSize(map_res_, map_res_, map_res_);
+            sor.filter(*surf_filtered);
+            map_surf_cloud_ = surf_filtered;
+            if (map_surf_cloud_->size() > 16000)
+                surf_cloud_queue_.erase(surf_cloud_queue_.begin());
         }
-        surf_cloud_queue_.push_back(cloud_surf_w);
-        map_surf_cloud_->clear();
-        for(auto& cloud : surf_cloud_queue_){
-            *map_surf_cloud_ += *cloud;
-        }
-        PointCloudXYZI::Ptr surf_filtered(new PointCloudXYZI);
-        pcl::VoxelGrid<PointType> sor;
-        sor.setInputCloud(map_surf_cloud_);
-        sor.setLeafSize(map_res_, map_res_, map_res_);
-        sor.filter(*surf_filtered);
-        map_surf_cloud_ = surf_filtered;
-        if (map_surf_cloud_->size() > 16000)
-            surf_cloud_queue_.erase(surf_cloud_queue_.begin());
+        // 发布坐标转换
+        odom_trans.header.stamp = ros::Time(measure.pcl_end_time);
+        odom_trans.header.frame_id = "map";
+        odom_trans.child_frame_id = "livox";
+        odom_trans.transform.translation.x = state_last_.pos.x();
+        odom_trans.transform.translation.y = state_last_.pos.y();
+        odom_trans.transform.translation.z = state_last_.pos.z();
+        odom_trans.transform.rotation.x = state_last_.rot.x();
+        odom_trans.transform.rotation.y = state_last_.rot.y();
+        odom_trans.transform.rotation.z = state_last_.rot.z();
+        odom_trans.transform.rotation.w = state_last_.rot.w();
+        odom_broadcaster.sendTransform(odom_trans);
+
+        // 发布路径
+        geometry_msgs::PoseStamped pose;
+        pose.header.stamp = ros::Time(measure.pcl_end_time);
+        pose.header.frame_id = "map";
+        pose.pose.position.x = state_last_.pos.x();
+        pose.pose.position.y = state_last_.pos.y();
+        pose.pose.position.z = state_last_.pos.z();
+        pose.pose.orientation.x = state_last_.rot.x();
+        pose.pose.orientation.y = state_last_.rot.y();
+        pose.pose.orientation.z = state_last_.rot.z();
+        pose.pose.orientation.w = state_last_.rot.w();
+        traj_local_msgs.poses.push_back(pose);
+        traj_local_msgs.header = pose.header;
+        pub_traj.publish(traj_local_msgs);
+
+        // 发布地图
+        sensor_msgs::PointCloud2 map_msg;
+        pcl::toROSMsg(*map_surf_cloud_, map_msg);
+        map_msg.header.stamp = ros::Time(measure.pcl_end_time);
+        map_msg.header.frame_id = "map";
+        pub_surf_map.publish(map_msg);
 
         if(1){
-            // state_last_ = state_queue_.back();
-            state_queue_.clear();
             auto euler = SO3Math::quat2euler(state_last_.rot);
             euler = euler * 180 / M_PI;
             std::cout << std::setprecision(15) << "time: " << state_last_.time << " euler: " << euler.transpose()<< std::endl;

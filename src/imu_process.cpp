@@ -56,7 +56,13 @@ int main(int argc, char** argv)
     model_param.accel_bias_std       = 50 * 1e-5;           // mGal 1mGal=1e-5Gal
     model_param.accel_bias_corr_time = 1 * 3600.0;
 
-    IMUProcess imu_process(model_param);
+    model_param.init_t_l_i(-0.09565903, -0.03466711, 0.0407548);
+    M3D R_L_I;
+    R_L_I << 0.99921203,  0.03962574, -0.00226486,
+             0.03961853, -0.99920993, -0.00314573,
+            -0.00238773,  0.00305353, -0.99999249;
+    model_param.init_r_l_i(R_L_I);
+    IMUProcess imu_process(model_param, nh);
 
     while(ros::ok()){
         if(!measure_queue.empty()){
