@@ -25,6 +25,7 @@
 
 #include "so3_math.hpp"
 #include "scan_registration.hpp"
+#include "tictoc.hpp"
 
 #include <ros/ros.h>
 #include <nav_msgs/Path.h>
@@ -219,8 +220,8 @@ private:
             // // p
             // PHImat.block<3, 3>(0,  3) = I_33 * dt;  
             // // v
-            // PHImat.block<3, 3>(3,  6) = SO3Math::get_skew_symmetric(state_curr.rot * imu.accel_mpss) * dt; 
-            // PHImat.block<3, 3>(3, 12) = state_curr.rot.toRotationMatrix() * dt;
+            // PHImat.block<3, 3>(3,  6) = -SO3Math::get_skew_symmetric(state_curr.rot * imu.accel_mpss) * dt; 
+            // PHImat.block<3, 3>(3, 12) = -state_curr.rot.toRotationMatrix() * dt;
             // PHImat.block<3, 3>(3, 15) = I_33 * dt;
             // // phi
             // PHImat.block<3, 3>(6,  6) = I_33 - SO3Math::get_skew_symmetric(imu.gyro_rps) * dt; // SO3Math::Exp(-imu.gyro_rps * dt)
@@ -336,8 +337,6 @@ private:
                 state_curr.rot = QD(R);            
                 state_curr.vel -= (state_curr.rot * imu.accel_mpss - state_curr.grav) * dt;
                 state_curr.pos -= state_curr.vel * dt;
-
-
 
                 V3D p_l_i((*pcl_in)[i].x, (*pcl_in)[i].y, (*pcl_in)[i].z);
                 V3D p_b_i = model_param_.R_L_I * p_l_i + model_param_.T_L_I; // 转换到惯导坐标系下
@@ -513,9 +512,6 @@ public:
     }
  
     void process(MeasureData& measure){
-
-        // ROS_INFO("measure size: %d", measure.imu_queue.size());
-
         // 特征提取
         ScanRegistration scan_registration;
         scan_registration.feature_extract(measure.cloud);
@@ -561,43 +557,50 @@ public:
         PointCloud::Ptr pcl_out = boost::make_shared<PointCloud>();
         point_cloud_undistort(measure, cloud_surf, pcl_out);
         // 点云迭代更新
+        TicToc t_update;
         iterate_update(measure, pcl_out);
+        ROS_INFO("update time: %f", t_update.toc());
         // 误差状态修正
         delta_x_ = Eigen::Matrix<double, N, 1>::Zero();
         // 地图增量更新
+        TicToc t_build_map;
         if(1){
             PointCloud::Ptr cloud_surf_w = boost::make_shared<PointCloud>();
-            cloud_surf_w->resize(pcl_out->size());
             PointCloud::Ptr cloud_surf_w_new = boost::make_shared<PointCloud>();
             for(int i = 0; i < pcl_out->size(); i++){
                 V3D pb((*pcl_out)[i].x, (*pcl_out)[i].y, (*pcl_out)[i].z);
                 V3D pw = state_last_.rot * pb + state_last_.pos; // 转换到世界坐标系下
-                (*cloud_surf_w)[i].x = pw.x();
-                (*cloud_surf_w)[i].y = pw.y();
-                (*cloud_surf_w)[i].z = pw.z();
-                
                 if(pb.norm() < 100){
-                    cloud_surf_w_new->push_back((*cloud_surf_w)[i]);
+                    PointType p;
+                    p.x = pw.x();
+                    p.y = pw.y();
+                    p.z = pw.z();
+                    cloud_surf_w->push_back(p);
                 }
             }
-            // surf_cloud_queue_.push_back(cloud_surf_w);
-            surf_cloud_queue_.push_back(cloud_surf_w_new);
+            TicToc t_build_cloud;
+            surf_cloud_queue_.push_back(cloud_surf_w);
             map_surf_cloud_->clear();
-            for(auto& cloud : surf_cloud_queue_){
+            for(auto& cloud : surf_cloud_queue_){ 
                 *map_surf_cloud_ += *cloud;
             }
+            ROS_INFO("build cloud time: %f", t_build_cloud.toc());
             PointCloudXYZI::Ptr surf_filtered(new PointCloudXYZI);
+            // ROS_INFO("map_size: %d", map_surf_cloud_->size());
+            TicToc t_filter;
             pcl::VoxelGrid<PointType> sor;
             sor.setInputCloud(map_surf_cloud_);
             sor.setLeafSize(map_res_, map_res_, map_res_);
             sor.filter(*surf_filtered);
             map_surf_cloud_ = surf_filtered;
-            ROS_INFO("%.15f map_size: %d", state_last_.time, map_surf_cloud_->size());
-            if (map_surf_cloud_->size() > 3000){
+            // ROS_INFO("map_size: %d", map_surf_cloud_->size());
+            ROS_INFO("pcl filter time: %f", t_filter.toc());
+            if (map_surf_cloud_->size() > 10000){
                 surf_cloud_queue_.erase(surf_cloud_queue_.begin());
             }
             // std::cout << "surf_cloud_queue_: " << surf_cloud_queue_.size() << std::endl;
         }
+        ROS_INFO("build map time: %f", t_build_map.toc());
         // 发布坐标转换
         odom_trans.header.stamp = ros::Time(measure.pcl_end_time);
         odom_trans.header.frame_id = "map";

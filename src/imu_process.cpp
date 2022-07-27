@@ -4,11 +4,12 @@
 
 #include <pcl_conversions/pcl_conversions.h>
 
-#include "imu_process.hpp"
-
 #include <queue>
 #include <thread>
 #include <chrono>
+
+#include "imu_process.hpp"
+#include "tictoc.hpp"
 
 int main(int argc, char** argv)
 {
@@ -114,7 +115,10 @@ int main(int argc, char** argv)
             // ROS_INFO("meas size: %d, imu_beg_time: %f, pcl_beg_time: %f", measure_queue.size(), meas.imu_queue.front().time, meas.pcl_beg_time);
             // ROS_INFO("meas size: %d, imu_end_time: %f, pcl_end_time: %f", measure_queue.size(), meas.imu_queue.back().time, meas.pcl_end_time);
             // ROS_INFO("--------------------");
+            TicToc t_process;
             imu_process.process(meas);
+            ROS_INFO("process time: %f", t_process.toc());
+            ROS_INFO("--------------------");
             measure_queue.pop();
         }
         ros::spinOnce();
