@@ -3,16 +3,10 @@
 
     <node pkg="simple_loam" type="CustomMsg2SensorMsg" name="CustomMsg2SensorMsg"/>
 
-    <!-- <node pkg="simple_loam" type="scanRegistration" name="scanRegistration" output="screen">
-        <param name="cloud_topic" value="/livox/lidar/sensor_pointcloud2"/>
-    </node> -->
-
-    <!-- <node pkg="simple_loam" type="laserOdometry" name="laserOdometry" output="screen"/> -->
-
     <node pkg="simple_lio" type="imu_process" name="imu_process" output="screen"/>
 
-    <node pkg="rosbag" type="play" name="rosbag" args="/home/ghowoght/Data_Sata/bag/20220402/2022-04-02-11-26-29.bag -r 1"/>
-    <!-- <node pkg="rosbag" type="play" name="rosbag" args="/home/ghowoght/Data_Sata/bag/20220118data/2022-01-18-10-15-00.bag -r 1"/> -->
+    <node pkg="rosbag" type="play" name="rosbag" args="/home/ghowoght/Data_Sata/bag/20220402/2022-04-02-11-26-29.bag -r 2"/>
+    <!-- <node pkg="rosbag" type="play" name="rosbag" args="/home/ghowoght/Data_Sata/bag/20220118data/2022-01-18-10-15-00.bag -r 2"/> -->
 
     <node launch-prefix="nice" pkg="rviz" type="rviz" name="rviz" args="-d $(find simple_lio)/rviz/simple_lio.rviz" />
 

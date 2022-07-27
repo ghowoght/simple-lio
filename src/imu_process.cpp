@@ -76,15 +76,12 @@ int main(int argc, char** argv)
             measure_queue.push(meas); 
             meas.cloud = nullptr;
             meas.imu_queue.clear();
-            ROS_INFO("add measure data");
-
         }
     });
 
     ros::Subscriber pcl_sub = nh.subscribe<sensor_msgs::PointCloud2>("/livox/lidar/sensor_pointcloud2", 100, [&](const sensor_msgs::PointCloud2ConstPtr& msg){
         cloud_queue.push(msg);
     });
-
 
     ROS_INFO("imu_process start");
 
@@ -110,7 +107,6 @@ int main(int argc, char** argv)
             -0.00238773,  0.00305353, -0.99999249;
     model_param.init_r_l_i(R_L_I);
     IMUProcess imu_process(model_param, nh);
-
 
     while(ros::ok()){
         if(!measure_queue.empty()){

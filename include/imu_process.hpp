@@ -159,7 +159,7 @@ private:
     // 地图相关
     std::vector<PointCloud::Ptr> surf_cloud_queue_;
     PointCloud::Ptr map_surf_cloud_;
-    double map_res_ = 0.8;
+    double map_res_ = 0.4;
     pcl::KdTreeFLANN<PointType> kdtree_;
 
 
@@ -402,7 +402,6 @@ private:
                     for (int k = 0; k < pointSearchInd.size(); k++){
                         nearest.push_back((*map_surf_cloud_)[pointSearchInd[k]]);
                     }
-                    
                     Eigen::Matrix<double, MATCH_NUM, 3> A = Eigen::Matrix<double, MATCH_NUM, 3>::Zero();
                     Eigen::Matrix<double, MATCH_NUM, 1> b = Eigen::Matrix<double, MATCH_NUM, 1>::Ones() * (-1.0);
                     for(int k = 0; k < MATCH_NUM; k++){
@@ -419,7 +418,6 @@ private:
                     abcd(1) = normvec(1);
                     abcd(2) = normvec(2);
                     abcd(3) = 1 / norm;
-
                     // 判断是否在同一平面
                     bool is_plane = true;
                     for(int k = 0; k < MATCH_NUM; k++){
@@ -428,7 +426,6 @@ private:
                             break;
                         }
                     }
-
                     // 计算点到平面的距离
                     double res = abcd(0) * wp.x() + abcd(1) * wp.y() + abcd(2) * wp.z() + abcd(3);
                     // 判断是否为有效点
@@ -463,8 +460,6 @@ private:
             dx.block<3, 1>(15, 0) = state_curr_iter.grav - state_iter_0.grav;
 
             auto dx_new = dx;
-            // if(cnt_ > 1)
-            // std::cout << "dx: " << dx.transpose() << std::endl;
             
             auto Amat_inv = SO3Math::J_l_inv(dx.block<3, 1>( 6, 0));
             Jmat.block<3, 3>(6, 6) = Amat_inv.transpose();
@@ -484,6 +479,11 @@ private:
             state_curr_iter.pos = state_last_iter.pos + delta.block<3, 1>( 0, 0);
             state_curr_iter.vel = state_last_iter.vel + delta.block<3, 1>( 3, 0);
             state_curr_iter.rot = state_last_iter.rot.toRotationMatrix() * SO3Math::Exp(delta.block<3, 1>( 6, 0));
+            double rot_norm = state_curr_iter.rot.x() * state_curr_iter.rot.x()
+                            + state_curr_iter.rot.y() * state_curr_iter.rot.y()
+                            + state_curr_iter.rot.z() * state_curr_iter.rot.z() 
+                            + state_curr_iter.rot.w() * state_curr_iter.rot.w();
+            state_curr_iter.rot.normalize(); // ?? 理论上不需要再进行归一化
             state_curr_iter.bg = state_last_iter.bg + delta.block<3, 1>( 9, 0);
             state_curr_iter.ba = state_last_iter.ba + delta.block<3, 1>(12, 0);
             // state_curr_iter.grav = state_last_iter.grav + delta.block<3, 1>(15, 0);
@@ -568,15 +568,20 @@ public:
         if(1){
             PointCloud::Ptr cloud_surf_w = boost::make_shared<PointCloud>();
             cloud_surf_w->resize(pcl_out->size());
+            PointCloud::Ptr cloud_surf_w_new = boost::make_shared<PointCloud>();
             for(int i = 0; i < pcl_out->size(); i++){
                 V3D pb((*pcl_out)[i].x, (*pcl_out)[i].y, (*pcl_out)[i].z);
                 V3D pw = state_last_.rot * pb + state_last_.pos; // 转换到世界坐标系下
                 (*cloud_surf_w)[i].x = pw.x();
                 (*cloud_surf_w)[i].y = pw.y();
                 (*cloud_surf_w)[i].z = pw.z();
+                
+                if(pb.norm() < 100){
+                    cloud_surf_w_new->push_back((*cloud_surf_w)[i]);
+                }
             }
-            // ROS_INFO("cloud_surf_w->size(): %d", cloud_surf_w->size());
-            surf_cloud_queue_.push_back(cloud_surf_w);
+            // surf_cloud_queue_.push_back(cloud_surf_w);
+            surf_cloud_queue_.push_back(cloud_surf_w_new);
             map_surf_cloud_->clear();
             for(auto& cloud : surf_cloud_queue_){
                 *map_surf_cloud_ += *cloud;
@@ -588,7 +593,7 @@ public:
             sor.filter(*surf_filtered);
             map_surf_cloud_ = surf_filtered;
             ROS_INFO("%.15f map_size: %d", state_last_.time, map_surf_cloud_->size());
-            if (map_surf_cloud_->size() > 2000){
+            if (map_surf_cloud_->size() > 3000){
                 surf_cloud_queue_.erase(surf_cloud_queue_.begin());
             }
             // std::cout << "surf_cloud_queue_: " << surf_cloud_queue_.size() << std::endl;

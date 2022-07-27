@@ -41,10 +41,8 @@ include_directories(
   ${CERES_INCLUDE_DIRS}
 )
 
-
-add_executable(simplelio_laserMapping src/laserMapping.cpp)
-target_link_libraries(simplelio_laserMapping
+add_executable(imu_process src/imu_process.cpp)
+target_link_libraries(imu_process
   ${catkin_LIBRARIES}
   ${PCL_LIBRARIES}
-  ${CERES_LIBRARIES}
 )
