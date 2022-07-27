@@ -17,32 +17,72 @@ int main(int argc, char** argv)
 
     std::queue<MeasureData> measure_queue;
     MeasureData meas;
+    std::queue<sensor_msgs::ImuConstPtr> imu_queue;
+    std::queue<sensor_msgs::PointCloud2ConstPtr> cloud_queue;
 
     ros::Subscriber imu_sub = nh.subscribe<sensor_msgs::Imu>("/imu0", 100, [&](const sensor_msgs::ImuConstPtr & msg)
-    {
-        double imu_time = msg->header.stamp.toSec();
-        if(meas.cloud == nullptr || imu_time <= meas.pcl_end_time){
-            auto&& accel_mpss = msg->linear_acceleration;
-            auto&& gyro_rps = msg->angular_velocity;
-            ImuData imu;
-            imu.time = msg->header.stamp.toSec();
-            imu.accel_mpss << accel_mpss.x, accel_mpss.y, accel_mpss.z;
-            imu.gyro_rps << gyro_rps.x, gyro_rps.y, gyro_rps.z;
-            meas.imu_queue.push_back(imu);
+    {   
+        imu_queue.push(msg);
+
+        if(cloud_queue.empty()) return;
+
+        auto pcl_msg = cloud_queue.front();
+        auto pcl_beg_time = pcl_msg->header.stamp.toSec();
+        auto pcl_end_time = pcl_msg->header.stamp.toSec() + 0.1;
+        while(!cloud_queue.empty() 
+            && !imu_queue.empty()
+            && imu_queue.front()->header.stamp.toSec() > pcl_end_time) // imu时刻比当前帧点云晚，则丢弃该帧点云
+        {
+            cloud_queue.pop();
+            pcl_msg = cloud_queue.front();
+            pcl_beg_time = pcl_msg->header.stamp.toSec();
+            pcl_end_time = pcl_msg->header.stamp.toSec() + 0.1;
+        }
+
+        if(!cloud_queue.empty() 
+            && !imu_queue.empty()
+            && imu_queue.back()->header.stamp.toSec() > pcl_end_time)
+        {
+            cloud_queue.pop();            
+            auto imu_msg = imu_queue.front();
+            auto imu_time = imu_msg->header.stamp.toSec();
+            while(imu_time <= pcl_end_time)
+            {   
+                imu_queue.pop();
+
+                if(imu_time < pcl_beg_time){
+                    imu_msg = imu_queue.front();
+                    imu_time = imu_msg->header.stamp.toSec();
+                    continue;
+                }
+                
+                auto&& accel_mpss = imu_msg->linear_acceleration;
+                auto&& gyro_rps = imu_msg->angular_velocity;
+                ImuData imu;
+                imu.time = imu_msg->header.stamp.toSec();
+                imu.accel_mpss << accel_mpss.x, accel_mpss.y, accel_mpss.z;
+                imu.gyro_rps   << gyro_rps.x, gyro_rps.y, gyro_rps.z;
+                meas.imu_queue.push_back(imu);
+
+                imu_msg = imu_queue.front();
+                imu_time = imu_msg->header.stamp.toSec();
+            }
+            meas.pcl_beg_time = pcl_beg_time;
+            meas.pcl_end_time = pcl_end_time;
+            PointCloud::Ptr cloud = boost::make_shared<PointCloud>();
+            pcl::fromROSMsg(*pcl_msg, *cloud);
+            meas.cloud = cloud;
+            // 将数据打包到队列中
+            measure_queue.push(meas); 
+            meas.cloud = nullptr;
+            meas.imu_queue.clear();
+            ROS_INFO("add measure data");
+
         }
     });
 
     ros::Subscriber pcl_sub = nh.subscribe<sensor_msgs::PointCloud2>("/livox/lidar/sensor_pointcloud2", 100, [&](const sensor_msgs::PointCloud2ConstPtr& msg){
-        PointCloud::Ptr cloud = boost::make_shared<PointCloud>();
-        pcl::fromROSMsg(*msg, *cloud);
-        meas.cloud = cloud;
-        meas.pcl_beg_time = msg->header.stamp.toSec();
-        meas.pcl_end_time = msg->header.stamp.toSec() + 0.1;
-        while(meas.imu_queue.front().time < meas.pcl_beg_time){
-            meas.imu_queue.erase(meas.imu_queue.begin());
-        }
-        measure_queue.push(meas); // 将数据打包到队列中
-        meas.cloud = nullptr;
+        cloud_queue.push(msg);
     });
 
 
@@ -71,11 +111,13 @@ int main(int argc, char** argv)
     model_param.init_r_l_i(R_L_I);
     IMUProcess imu_process(model_param, nh);
 
+
     while(ros::ok()){
         if(!measure_queue.empty()){
-            // ROS_INFO("meas size: %d, time1: %f, time2: %f", measure_queue.size(), measure_queue.back().imu_queue.front().time, measure_queue.back().pcl_beg_time);
-            // ROS_INFO("meas size: %d, time1: %f, time2: %f", measure_queue.size(), measure_queue.back().imu_queue.back().time, measure_queue.back().pcl_end_time);
             auto&& meas = measure_queue.front();
+            // ROS_INFO("meas size: %d, imu_beg_time: %f, pcl_beg_time: %f", measure_queue.size(), meas.imu_queue.front().time, meas.pcl_beg_time);
+            // ROS_INFO("meas size: %d, imu_end_time: %f, pcl_end_time: %f", measure_queue.size(), meas.imu_queue.back().time, meas.pcl_end_time);
+            // ROS_INFO("--------------------");
             imu_process.process(meas);
             measure_queue.pop();
         }
