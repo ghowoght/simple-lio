@@ -159,7 +159,7 @@ private:
     // 地图相关
     std::vector<PointCloud::Ptr> surf_cloud_queue_;
     PointCloud::Ptr map_surf_cloud_;
-    double map_res_ = 0.2;
+    double map_res_ = 0.8;
     pcl::KdTreeFLANN<PointType> kdtree_;
 
 
@@ -254,10 +254,15 @@ private:
             // Gmat_.block<3, 3>( 9, 6) = I_33;
             // Gmat_.block<3, 3>(12, 9) = I_33;
             
-            // 梯形积分
+            // Gmat_.block<3, 3>( 3, 0) = -state_curr.rot.toRotationMatrix();
+            // Gmat_.block<3, 3>( 6, 3) = -SO3Math::J_l(imu.gyro_rps * dt).transpose();
+            // Gmat_.block<3, 3>( 9, 6) = I_33;
+            // Gmat_.block<3, 3>(12, 9) = I_33;
+            // // 梯形积分
             // auto Qmat = 0.5 * (PHImat * Gmat_last_ * qmat * Gmat_last_.transpose() * PHImat.transpose()
             //             + Gmat_ * qmat * Gmat_.transpose()) * dt;
             // Gmat_last_ = Gmat_;
+
             Gmat_.block<3, 3>( 3, 0) = -state_curr.rot.toRotationMatrix() * dt;
             Gmat_.block<3, 3>( 6, 3) = -SO3Math::J_l(imu.gyro_rps * dt).transpose() * dt;
             Gmat_.block<3, 3>( 9, 6) = I_33 * dt;
@@ -304,17 +309,19 @@ private:
         int idx = 0;
         for(int i = pcl_in->size() - 1; i >= 0; i--){
             auto& point_curr = (*pcl_in)[i];
-            double time_interval = map_res_;
+            double time_interval = 0.1;
             double time_curr_point = measure.pcl_beg_time + point_curr.curvature * time_interval;
+
+            auto p_to_add = (*pcl_in)[i];
 
             if(time_curr_point > state_bp_queue_[idx].time){
                 V3D p_l_i((*pcl_in)[i].x, (*pcl_in)[i].y, (*pcl_in)[i].z);
                 V3D p_b_i = model_param_.R_L_I * p_l_i + model_param_.T_L_I; // 转换到惯导坐标系下
-                auto p = (*pcl_in)[i];
-                p.x = p_b_i.x();
-                p.y = p_b_i.y();
-                p.z = p_b_i.z();
-                pcl_out->push_back(p);
+
+                p_to_add.x = p_b_i.x();
+                p_to_add.y = p_b_i.y();
+                p_to_add.z = p_b_i.z();
+
                 continue;
             }
             while(time_curr_point < state_bp_queue_[idx + 1].time){
@@ -330,18 +337,24 @@ private:
                 state_curr.vel -= (state_curr.rot * imu.accel_mpss - state_curr.grav) * dt;
                 state_curr.pos -= state_curr.vel * dt;
 
+
+
                 V3D p_l_i((*pcl_in)[i].x, (*pcl_in)[i].y, (*pcl_in)[i].z);
                 V3D p_b_i = model_param_.R_L_I * p_l_i + model_param_.T_L_I; // 转换到惯导坐标系下
                 V3D p_b_end = state_curr.rot * p_b_i + state_curr.pos;      // 转换到扫描结束时刻的惯导坐标系下
-                auto p = (*pcl_in)[i];
-                p.x = p_b_end.x();
-                p.y = p_b_end.y();
-                p.z = p_b_end.z();
-                pcl_out->push_back(p);
+                
+                p_to_add.x = p_b_end.x();
+                p_to_add.y = p_b_end.y();
+                p_to_add.z = p_b_end.z();
 
                 // std::cout << "p_b_end: " << p_b_end.transpose() << std::endl;
             }
-            
+            if(std::isfinite(p_to_add.x) && std::isfinite(p_to_add.y) && std::isfinite(p_to_add.z)){
+                pcl_out->push_back(p_to_add);
+            }
+            else{
+                std::cout << "p_to_add: " << p_to_add.x << std::endl;
+            }
         }
         // std::cout << "----------------------------------------------------" << std::endl;
     }
@@ -363,7 +376,7 @@ private:
         auto state_iter_0 = state_queue_.back(); // 迭代前的状态
         Eigen::Matrix<double, N, N> Jmat = Eigen::Matrix<double, N, N>::Identity();
         Eigen::Matrix<double, N, N> Jmat_inv = Eigen::Matrix<double, N, N>::Identity();
-        for(int iter = 0; iter < 5; iter++){
+        for(int iter = 0; iter < 10; iter++){
 
             std::vector<EffectFeature> effect_feature_queue;
             // ROS_INFO("pcl_features: %d", pcl_features->size());
@@ -376,52 +389,53 @@ private:
                 p.y = wp.y();
                 p.z = wp.z();
                 // 最近邻搜索
-                kdtree_.nearestKSearch(p, 8, pointSearchInd, pointSearchSqDis);
+                if(!std::isfinite(wp.x()) || std::isnan(wp.x())){
+                    std::cout << "iter: " << iter << " i: " << i << "/" << pcl_features->size() << " cp: " << cp.transpose() << std::endl;
+                }
+                const int MATCH_NUM = 5;
+                kdtree_.nearestKSearch(p, MATCH_NUM, pointSearchInd, pointSearchSqDis);
+                
                 // 最近邻都在指定范围内
-                if (pointSearchSqDis[7] < 5){
+                if (pointSearchSqDis[MATCH_NUM - 1] < 5){
                     // 计算质心和协方差
                     PointCloudXYZI nearest;
                     for (int k = 0; k < pointSearchInd.size(); k++){
                         nearest.push_back((*map_surf_cloud_)[pointSearchInd[k]]);
                     }
-                    Eigen::Vector4f centroid;   // 质心
-                    Eigen::Matrix3f covariance; // 协方差
-                    pcl::compute3DCentroid(nearest, centroid);
-                    pcl::computeCovarianceMatrix(nearest, centroid, covariance);
-
-                    // 计算协方差矩阵的特征值
-                    Eigen::Vector3f eigenValues;
-                    pcl::eigen33(covariance, eigenValues);
-
-                    std::vector<float> eigenValues_sort{eigenValues[0], eigenValues[1], eigenValues[2]};
-                    std::sort(eigenValues_sort.begin(), eigenValues_sort.end()); // 升序排列
-                    // 最近邻在一个平面上
-                    if (eigenValues_sort[1] > 3 * eigenValues_sort[0])
-                    {
-                        Eigen::Matrix<double, 8, 3> A = Eigen::Matrix<double, 8, 3>::Zero();
-                        Eigen::Matrix<double, 8, 1> b = Eigen::Matrix<double, 8, 1>::Ones() * (-1.0);
-                        for(int k = 0; k < 8; k++){
-                            A(k, 0) = nearest[k].x;
-                            A(k, 1) = nearest[k].y;
-                            A(k, 2) = nearest[k].z;
-                        }
-                        V3D normvec = A.colPivHouseholderQr().solve(b); // 求解法向量
-                        double norm = normvec.norm();
-                        normvec.normalize();
-
-                        Eigen::Vector4d abcd;
-                        abcd(0) = normvec(0);
-                        abcd(1) = normvec(1);
-                        abcd(2) = normvec(2);
-                        abcd(3) = 1 / norm;
-
-                        // 计算点到平面的距离
-                        double res = abcd(0) * wp.x() + abcd(1) * wp.y() + abcd(2) * wp.z() + abcd(3);
-                        // 判断是否为有效点
-                        double s = 1 - 0.9 * fabs(res) / sqrt(cp.norm());
-                        if(s > 0.9)
-                            effect_feature_queue.push_back(EffectFeature{cp, normvec, res});
+                    
+                    Eigen::Matrix<double, MATCH_NUM, 3> A = Eigen::Matrix<double, MATCH_NUM, 3>::Zero();
+                    Eigen::Matrix<double, MATCH_NUM, 1> b = Eigen::Matrix<double, MATCH_NUM, 1>::Ones() * (-1.0);
+                    for(int k = 0; k < MATCH_NUM; k++){
+                        A(k, 0) = nearest[k].x;
+                        A(k, 1) = nearest[k].y;
+                        A(k, 2) = nearest[k].z;
                     }
+                    V3D normvec = A.colPivHouseholderQr().solve(b); // 求解法向量
+                    double norm = normvec.norm();
+                    normvec.normalize();
+
+                    Eigen::Vector4d abcd;
+                    abcd(0) = normvec(0);
+                    abcd(1) = normvec(1);
+                    abcd(2) = normvec(2);
+                    abcd(3) = 1 / norm;
+
+                    // 判断是否在同一平面
+                    bool is_plane = true;
+                    for(int k = 0; k < MATCH_NUM; k++){
+                        if(abcd(0) * nearest[k].x + abcd(1) * nearest[k].y + abcd(2) * nearest[k].z + abcd(3) > 0.1){
+                            is_plane = false;
+                            break;
+                        }
+                    }
+
+                    // 计算点到平面的距离
+                    double res = abcd(0) * wp.x() + abcd(1) * wp.y() + abcd(2) * wp.z() + abcd(3);
+                    // 判断是否为有效点
+                    double s = 1 - 0.9 * fabs(res) / sqrt(cp.norm());
+                    if(s > 0.9 && is_plane)
+                        effect_feature_queue.push_back(EffectFeature{cp, normvec, res});
+                    
                 }
             }
             Hmat_ = Eigen::MatrixXd::Zero(effect_feature_queue.size(), N);
@@ -450,7 +464,7 @@ private:
 
             auto dx_new = dx;
             // if(cnt_ > 1)
-            //     std::cout << "dx: " << dx.transpose() << std::endl;
+            // std::cout << "dx: " << dx.transpose() << std::endl;
             
             auto Amat_inv = SO3Math::J_l_inv(dx.block<3, 1>( 6, 0));
             Jmat.block<3, 3>(6, 6) = Amat_inv.transpose();
@@ -499,6 +513,8 @@ public:
     }
  
     void process(MeasureData& measure){
+
+        // ROS_INFO("measure size: %d", measure.imu_queue.size());
 
         // 特征提取
         ScanRegistration scan_registration;
@@ -559,6 +575,7 @@ public:
                 (*cloud_surf_w)[i].y = pw.y();
                 (*cloud_surf_w)[i].z = pw.z();
             }
+            // ROS_INFO("cloud_surf_w->size(): %d", cloud_surf_w->size());
             surf_cloud_queue_.push_back(cloud_surf_w);
             map_surf_cloud_->clear();
             for(auto& cloud : surf_cloud_queue_){
@@ -570,8 +587,11 @@ public:
             sor.setLeafSize(map_res_, map_res_, map_res_);
             sor.filter(*surf_filtered);
             map_surf_cloud_ = surf_filtered;
-            if (map_surf_cloud_->size() > 16000)
+            ROS_INFO("%.15f map_size: %d", state_last_.time, map_surf_cloud_->size());
+            if (map_surf_cloud_->size() > 2000){
                 surf_cloud_queue_.erase(surf_cloud_queue_.begin());
+            }
+            // std::cout << "surf_cloud_queue_: " << surf_cloud_queue_.size() << std::endl;
         }
         // 发布坐标转换
         odom_trans.header.stamp = ros::Time(measure.pcl_end_time);
@@ -611,7 +631,7 @@ public:
         if(1){
             auto euler = SO3Math::quat2euler(state_last_.rot);
             euler = euler * 180 / M_PI;
-            std::cout << std::setprecision(15) << "time: " << state_last_.time << " euler: " << euler.transpose()<< std::endl;
+            // std::cout << std::setprecision(15) << "time: " << state_last_.time << " euler: " << euler.transpose()<< std::endl;
         }
     }
 
