@@ -1,12 +1,12 @@
 cmake_minimum_required(VERSION 3.0.2)
 project(simple_lio)
 
-# add_compile_options(-std=c++14)
-
 set(CMAKE_BUILD_TYPE "Release")
 
+set( CMAKE_CXX_FLAGS "-std=c++14 -O3" )
+
 set(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} -fexceptions")
-set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -std=c++11 -pthread -std=c++0x -std=c++14 -fexceptions -Wno-unused-local-typedefs")
+set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -pthread -fexceptions -Wno-unused-local-typedefs")
 
 find_package(OpenMP QUIET)
 set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} ${OpenMP_CXX_FLAGS}")
