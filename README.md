@@ -17,3 +17,12 @@
 - [ ] 使用加速度计初始化横滚角和俯仰角
 - [ ] 优化重力向量
 - [ ] 更改地图更新策略
+
+
+
+# Result
+
+| ![simple-lio](C:\1A\Projects\1A-SLAM\simple_lio\img\simple-lio.png) | ![fast-lio](C:\1A\Projects\1A-SLAM\simple_lio\img\fast-lio.png) |
+| :----------------------------------------------------------: | :----------------------------------------------------------: |
+|                             this                             |                           fast-lio                           |
+
