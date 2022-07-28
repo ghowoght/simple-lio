@@ -22,7 +22,7 @@
 
 # Result
 
-| ![simple-lio](C:\1A\Projects\1A-SLAM\simple_lio\img\simple-lio.png) | ![fast-lio](C:\1A\Projects\1A-SLAM\simple_lio\img\fast-lio.png) |
-| :----------------------------------------------------------: | :----------------------------------------------------------: |
-|                             this                             |                           fast-lio                           |
+| ![simple-lio](./img/simple-lio.png) | ![fast-lio](./img/fast-lio.png) |
+| :---------------------------------: | :-----------------------------: |
+|                this                 |            fast-lio             |
 
