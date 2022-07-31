@@ -41,8 +41,11 @@ include_directories(
   ${CERES_INCLUDE_DIRS}
 )
 
+add_subdirectory(3rd_party/spdlog)
+
 add_executable(imu_process src/imu_process.cpp)
 target_link_libraries(imu_process
   ${catkin_LIBRARIES}
   ${PCL_LIBRARIES}
+  spdlog::spdlog
 )

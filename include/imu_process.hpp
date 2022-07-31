@@ -26,18 +26,22 @@
 #include "so3_math.hpp"
 #include "scan_registration.hpp"
 #include "tictoc.hpp"
+#include "file_helper.hpp"
 
 #include <ros/ros.h>
 #include <nav_msgs/Path.h>
 #include <tf/transform_broadcaster.h>
 
+#include <spdlog/spdlog.h>
+#include <spdlog/sinks/basic_file_sink.h>
+
 #define N 18 // 状态维度
 
-typedef pcl::PointXYZINormal PointType;
-typedef pcl::PointCloud<PointType> PointCloud;
-typedef Eigen::Vector3d V3D;
-typedef Eigen::Matrix3d M3D;
-typedef Eigen::Quaterniond QD;
+using PointType = pcl::PointXYZINormal;
+using PointCloud = pcl::PointCloud<PointType>;
+using V3D = Eigen::Vector3d;
+using M3D = Eigen::Matrix3d;
+using QD = Eigen::Quaterniond;
 
 struct StateEKF{
     double time;
@@ -73,6 +77,16 @@ struct StateEKF{
         bg = other.bg;
         ba = other.ba;
         grav = other.grav;
+    }
+
+    inline std::string to_string() const{
+        V3D euler = SO3Math::quat2euler(rot);
+        return fmt::format("{} {} {} {} {} {} {} {} {} {}\n", 
+                            time,
+                            pos.x(), pos.y(), pos.z(),
+                            vel.x(), vel.y(), vel.z(),
+                            euler[0], euler[1], euler[2]
+                            );
     }
 };
 
@@ -163,12 +177,23 @@ private:
     pcl::KdTreeFLANN<PointType> kdtree_;
     int KNN_MATCH_NUM = 5; // K近邻匹配点数
 
+    // 定位结果
+    std::shared_ptr<spdlog::logger> logger_;
+    FileWriterPtr trajctory_writer_;
+
+
+
 public:
     IMUProcess()=default;
     IMUProcess(const ModelParam& model_param, ros::NodeHandle& nh) : model_param_(model_param), nh_(nh){
 
         pub_surf_map = nh_.advertise<sensor_msgs::PointCloud2>("/surf_map", 1);
         pub_traj     = nh_.advertise<nav_msgs::Path>("/traj/local", 10);
+
+        logger_ = spdlog::basic_logger_st("trajctory", "/home/ghowoght/workspace/lidar_ws/src/simple_lio/logger.txt");
+
+        trajctory_writer_ = FileWriter::create("/home/ghowoght/workspace/lidar_ws/src/simple_lio/trajctory.txt");
+
 
         map_surf_cloud_ = boost::make_shared<PointCloud>();
         state_last_ = StateEKF();
@@ -184,6 +209,9 @@ public:
         Pmat_(15,15) = Pmat_(16,16) = Pmat_(17,17) = 0.00001;
         // Pmat_.block<3, 3>(9, 9) = gb;
         // Pmat_.block<3, 3>(12, 12) = ab;
+    }
+    ~IMUProcess(){
+        spdlog::drop_all();
     }
 
 private:
@@ -356,7 +384,9 @@ private:
     void iterate_update(MeasureData& measure, PointCloud::Ptr& pcl_features){
         // ROS_INFO("map_surf_cloud: %d", map_surf_cloud_->size());
         // 构建KD-Tree
+        TicToc t_build_kdtree;
         kdtree_.setInputCloud(map_surf_cloud_); 
+
         // KD-Tree最近邻搜索结果的索引和距离
         std::vector<int> pointSearchInd;
         std::vector<float> pointSearchSqDis;
@@ -556,7 +586,7 @@ public:
             for(int i = 0; i < pcl_out->size(); i++){
                 V3D pb((*pcl_out)[i].x, (*pcl_out)[i].y, (*pcl_out)[i].z);
                 V3D pw = state_last_.rot * pb + state_last_.pos; // 转换到世界坐标系下
-                if(pb.norm() < 100){
+                if(pb.norm() < 150){
                     PointType p;
                     p.x = pw.x();
                     p.y = pw.y();
@@ -626,6 +656,8 @@ public:
             auto euler = SO3Math::quat2euler(state_last_.rot);
             euler = euler * 180 / M_PI;
             // std::cout << std::setprecision(15) << "time: " << state_last_.time << " euler: " << euler.transpose()<< std::endl;
+
+            trajctory_writer_->write_txt(state_last_.to_string());
         }
     }
 
