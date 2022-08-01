@@ -27,6 +27,7 @@
 #include "scan_registration.hpp"
 #include "tictoc.hpp"
 #include "file_helper.hpp"
+#include "ikd-Tree/ikd_Tree.h"
 
 #include <ros/ros.h>
 #include <nav_msgs/Path.h>
@@ -42,6 +43,9 @@ using PointCloud = pcl::PointCloud<PointType>;
 using V3D = Eigen::Vector3d;
 using M3D = Eigen::Matrix3d;
 using QD = Eigen::Quaterniond;
+
+using PointVector = KD_TREE<PointType>::PointVector;
+template class KD_TREE<PointType>;
 
 struct StateEKF{
     double time;
@@ -148,6 +152,7 @@ class IMUProcess{
 private:
     ros::NodeHandle nh_;
     ros::Publisher pub_surf_map;
+    ros::Publisher pub_surf_cloud;
     ros::Publisher pub_traj;
     tf::TransformBroadcaster odom_broadcaster;
     geometry_msgs::TransformStamped odom_trans;
@@ -170,12 +175,18 @@ private:
     Eigen::Matrix<double, Eigen::Dynamic, N> Hmat_;
     Eigen::Matrix<double, N, Eigen::Dynamic> Kmat_;
 
+    int max_iter_times_ = 5;
+
     // 地图相关
     std::vector<PointCloud::Ptr> surf_cloud_queue_;
     PointCloud::Ptr map_surf_cloud_;
-    double map_res_ = 0.4;
+    double map_res_ = 0.5;
     pcl::KdTreeFLANN<PointType> kdtree_;
+    PointVector nearest;    // 最近邻搜索结果
+    std::vector<PointVector> nearest_queue_;
     int KNN_MATCH_NUM = 5; // K近邻匹配点数
+
+    KD_TREE<PointType>::Ptr ikd_tree_;
 
     // 定位结果
     std::shared_ptr<spdlog::logger> logger_;
@@ -188,6 +199,7 @@ public:
     IMUProcess(const ModelParam& model_param, ros::NodeHandle& nh) : model_param_(model_param), nh_(nh){
 
         pub_surf_map = nh_.advertise<sensor_msgs::PointCloud2>("/surf_map", 1);
+        pub_surf_cloud = nh_.advertise<sensor_msgs::PointCloud2>("/surf_cloud", 1);
         pub_traj     = nh_.advertise<nav_msgs::Path>("/traj/local", 10);
 
         logger_ = spdlog::basic_logger_st("trajctory", "/home/ghowoght/workspace/lidar_ws/src/simple_lio/logger.txt");
@@ -196,6 +208,9 @@ public:
 
 
         map_surf_cloud_ = boost::make_shared<PointCloud>();
+        ikd_tree_ = std::make_shared<KD_TREE<PointType>>(); // delete_param, balance_param, box_length
+        ikd_tree_->set_downsample_param(map_res_);
+        
         state_last_ = StateEKF();
         // M3D gb = Eigen::Vector3d(model_param.gyro_bias_std * model_param.gyro_bias_std, 
         //                         model_param.gyro_bias_std * model_param.gyro_bias_std, 
@@ -396,9 +411,10 @@ private:
         auto state_iter_0 = state_queue_.back();    // 迭代更新前的状态
         Eigen::Matrix<double, N, N> Jmat = Eigen::Matrix<double, N, N>::Identity();
         Eigen::Matrix<double, N, N> Jmat_inv = Eigen::Matrix<double, N, N>::Identity();
-        for(int iter = 0; iter < 5; iter++){
+        for(int iter = 0; iter < max_iter_times_; iter++){
             std::vector<EffectFeature> effect_feature_queue; // 有效特征点队列
             // ROS_INFO("pcl_features: %d", pcl_features->size());
+            nearest_queue_.clear(); // 清空最近邻队列
             for(int i = 0; i < pcl_features->size(); i++){
                 auto p = (*pcl_features)[i];
                 // 将特征点投影到世界坐标系
@@ -411,14 +427,10 @@ private:
                     std::cout << "iter: " << iter << " i: " << i << "/" << pcl_features->size() << " cp: " << cp.transpose() << std::endl;
                 }
                 // 最近邻搜索
-                kdtree_.nearestKSearch(p, KNN_MATCH_NUM, pointSearchInd, pointSearchSqDis);
-                
+                ikd_tree_->Nearest_Search(p, KNN_MATCH_NUM, nearest, pointSearchSqDis);
+                nearest_queue_.push_back(nearest);
                 // 最近邻都在指定范围内
                 if (pointSearchSqDis[KNN_MATCH_NUM - 1] < 5){
-                    PointCloudXYZI nearest;
-                    for (int k = 0; k < pointSearchInd.size(); k++){
-                        nearest.push_back((*map_surf_cloud_)[pointSearchInd[k]]);
-                    }
                     // 求解方程Ax=b
                     Eigen::Matrix<double, Eigen::Dynamic, 3> A = Eigen::MatrixXd::Zero(KNN_MATCH_NUM, 3);
                     Eigen::Matrix<double, Eigen::Dynamic, 1> b = Eigen::VectorXd::Ones(KNN_MATCH_NUM) * (-1.0);
@@ -452,6 +464,7 @@ private:
                         effect_feature_queue.push_back(EffectFeature{cp, normvec, res});
                 }
             }
+            spdlog::info("effect_feature_queue: {}", effect_feature_queue.size());
             Hmat_ = Eigen::MatrixXd::Zero(effect_feature_queue.size(), N);
             delta_z_ = Eigen::VectorXd::Zero(effect_feature_queue.size());
             for(int i = 0; i < effect_feature_queue.size(); i++){
@@ -510,6 +523,55 @@ private:
         Pmat_ = (Eigen::Matrix<double, N, N>::Identity() - Kmat_ * Hmat_) * Pmat_;
     }
 
+    void map_update(PointCloud::Ptr& features){
+        TicToc t_build_map;
+        PointCloud::Ptr points_to_add = boost::make_shared<PointCloud>();
+        PointCloud::Ptr points_not_to_downsample = boost::make_shared<PointCloud>();
+        for(int i = 0; i < features->size(); i++){
+            auto& nearest = nearest_queue_[i];
+            V3D pb((*features)[i].x, (*features)[i].y, (*features)[i].z);
+            V3D pw = state_last_.rot * pb + state_last_.pos; // 转换到世界坐标系下
+
+            if(pb.norm() > 150) continue;
+
+            PointType p;
+            p.x = pw.x();
+            p.y = pw.y();
+            p.z = pw.z();
+
+            PointType mid_point;
+            mid_point.x = floor(pw.x() / map_res_) * map_res_ + map_res_ / 2;
+            mid_point.y = floor(pw.y() / map_res_) * map_res_ + map_res_ / 2;
+            mid_point.z = floor(pw.z() / map_res_) * map_res_ + map_res_ / 2;
+            V3D p_mid(mid_point.x, mid_point.y, mid_point.z);
+            double dist = (pw - p_mid).norm();
+            if(fabs(nearest[0].x - mid_point.x) > map_res_ / 2
+                && fabs(nearest[0].y - mid_point.y) > map_res_ / 2
+                && fabs(nearest[0].z - mid_point.z) > map_res_ / 2){
+                points_not_to_downsample->push_back(p);
+                continue;
+            }
+            bool need_add = true;
+            for(int k = 0; k < KNN_MATCH_NUM; k++){
+                if(nearest.size() < KNN_MATCH_NUM)
+                    break;
+                V3D pn(nearest[k].x, nearest[k].y, nearest[k].z);
+                if((pn - p_mid).norm() < dist){
+                    need_add = false;
+                    break;
+                }
+            }
+            if(need_add){
+                points_to_add->push_back(p);
+            }
+        }
+        ikd_tree_->Add_Points(points_to_add->points, true);
+        ikd_tree_->Add_Points(points_not_to_downsample->points, false);
+        ROS_INFO("build map time: %f", t_build_map.toc());
+
+        spdlog::info("map size: {}", ikd_tree_->validnum());
+    }
+
 public:
     bool init_imu(MeasureData& measure){
         static int cnt = 0;
@@ -528,7 +590,6 @@ public:
         }
         return false;
     }
- 
     void process(MeasureData& measure){
         // 特征提取
         ScanRegistration scan_registration;
@@ -559,6 +620,8 @@ public:
                 is_initialized_ = true;
                 state_last_.time = measure.imu_queue.back().time;
                 state_queue_.clear();
+
+                ikd_tree_->Build(map_surf_cloud_->points);
             }
             return;
         }
@@ -579,44 +642,7 @@ public:
         iterate_update(measure, pcl_out);
         ROS_INFO("update time: %f", t_update.toc());
         // 地图增量更新
-        TicToc t_build_map;
-        if(1){
-            PointCloud::Ptr cloud_surf_w = boost::make_shared<PointCloud>();
-            PointCloud::Ptr cloud_surf_w_new = boost::make_shared<PointCloud>();
-            for(int i = 0; i < pcl_out->size(); i++){
-                V3D pb((*pcl_out)[i].x, (*pcl_out)[i].y, (*pcl_out)[i].z);
-                V3D pw = state_last_.rot * pb + state_last_.pos; // 转换到世界坐标系下
-                if(pb.norm() < 150){
-                    PointType p;
-                    p.x = pw.x();
-                    p.y = pw.y();
-                    p.z = pw.z();
-                    cloud_surf_w->push_back(p);
-                }
-            }
-            TicToc t_build_cloud;
-            surf_cloud_queue_.push_back(cloud_surf_w);
-            map_surf_cloud_->clear();
-            for(auto& cloud : surf_cloud_queue_){ 
-                *map_surf_cloud_ += *cloud;
-            }
-            ROS_INFO("build cloud time: %f", t_build_cloud.toc());
-            PointCloudXYZI::Ptr surf_filtered(new PointCloudXYZI);
-            // ROS_INFO("map_size: %d", map_surf_cloud_->size());
-            TicToc t_filter;
-            pcl::VoxelGrid<PointType> sor;
-            sor.setInputCloud(map_surf_cloud_);
-            sor.setLeafSize(map_res_, map_res_, map_res_);
-            sor.filter(*surf_filtered);
-            map_surf_cloud_ = surf_filtered;
-            // ROS_INFO("map_size: %d", map_surf_cloud_->size());
-            ROS_INFO("pcl filter time: %f", t_filter.toc());
-            if (map_surf_cloud_->size() > 10000){
-                surf_cloud_queue_.erase(surf_cloud_queue_.begin());
-            }
-            // std::cout << "surf_cloud_queue_: " << surf_cloud_queue_.size() << std::endl;
-        }
-        ROS_INFO("build map time: %f", t_build_map.toc());
+        map_update(pcl_out);
         // 发布坐标转换
         odom_trans.header.stamp = ros::Time(measure.pcl_end_time);
         odom_trans.header.frame_id = "map";
@@ -647,10 +673,33 @@ public:
 
         // 发布地图
         sensor_msgs::PointCloud2 map_msg;
+        // PointVector ().swap(ikd_tree_->PCL_Storage);
+        // ikd_tree_->flatten(ikd_tree_->Root_Node, ikd_tree_->PCL_Storage, NOT_RECORD);
+        // map_surf_cloud_->clear();
+        // map_surf_cloud_->points = ikd_tree_->PCL_Storage;
+        
         pcl::toROSMsg(*map_surf_cloud_, map_msg);
         map_msg.header.stamp = ros::Time(measure.pcl_end_time);
         map_msg.header.frame_id = "map";
         pub_surf_map.publish(map_msg);
+
+        // 发布点云
+        PointCloud::Ptr points_world = boost::make_shared<PointCloud>();
+        for(int i = 0; i < pcl_out->size(); i++){
+            V3D pb((*pcl_out)[i].x, (*pcl_out)[i].y, (*pcl_out)[i].z);
+            // V3D pb = model_param_.R_L_I * pl + model_param_.T_L_I; // 转换到惯性系
+            V3D pw = state_last_.rot * pb + state_last_.pos; // 转换到世界坐标系下
+            if(pb.norm() > 150) continue;
+            PointType p;
+            p.x = pw.x();
+            p.y = pw.y();
+            p.z = pw.z();
+            points_world->push_back(p);
+        }
+        pcl::toROSMsg(*points_world, map_msg);
+        map_msg.header.stamp = ros::Time(measure.pcl_end_time);
+        map_msg.header.frame_id = "map";
+        pub_surf_cloud.publish(map_msg);
 
         if(1){
             auto euler = SO3Math::quat2euler(state_last_.rot);

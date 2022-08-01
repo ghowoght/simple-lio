@@ -43,7 +43,7 @@ include_directories(
 
 add_subdirectory(3rd_party/spdlog)
 
-add_executable(imu_process src/imu_process.cpp)
+add_executable(imu_process src/imu_process.cpp include/ikd-Tree/ikd_Tree.cpp)
 target_link_libraries(imu_process
   ${catkin_LIBRARIES}
   ${PCL_LIBRARIES}
