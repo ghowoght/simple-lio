@@ -130,6 +130,7 @@ struct ModelParam{
     double gyro_bias_corr_time;             // 陀螺仪零偏相关时间
     double accel_bias_std;                  // 加速度计零偏标准差
     double accel_bias_corr_time;            // 加速度计零偏相关时间
+    double R;                               // 激光雷达协方差
     QD R_L_I = QD::Identity();              // 外参: IMU坐标系到点云坐标系的旋转
     V3D T_L_I;                              // 外参: IMU坐标系到点云坐标系的变换
     void init_r_l_i(double roll, double pitch, double yaw){
@@ -265,7 +266,7 @@ private:
             // PHImat.block<3, 3>(3, 12) = -state_curr.rot.toRotationMatrix() * dt;
             // PHImat.block<3, 3>(3, 15) = I_33 * dt;
             // // phi
-            // PHImat.block<3, 3>(6,  6) = I_33 - SO3Math::get_skew_symmetric(imu.gyro_rps) * dt; // SO3Math::Exp(-imu.gyro_rps * dt)
+            // // PHImat.block<3, 3>(6,  6) = I_33 - SO3Math::get_skew_symmetric(imu.gyro_rps) * dt; // SO3Math::Exp(-imu.gyro_rps * dt)
             // PHImat.block<3, 3>(6,  9) = -state_curr.rot.toRotationMatrix() * dt;
 
             // p
@@ -275,8 +276,10 @@ private:
             PHImat.block<3, 3>(3, 12) = -state_curr.rot.toRotationMatrix() * dt;
             PHImat.block<3, 3>(3, 15) = I_33 * dt;
             // phi
-            PHImat.block<3, 3>(6,  6) = SO3Math::Exp(-imu.gyro_rps * dt);
-            PHImat.block<3, 3>(6,  9) = -SO3Math::J_l(imu.gyro_rps * dt).transpose() * dt;
+            // PHImat.block<3, 3>(6,  6) = SO3Math::Exp(-imu.gyro_rps * dt);
+            // PHImat.block<3, 3>(6,  9) = -SO3Math::J_l(imu.gyro_rps * dt).transpose() * dt;
+            PHImat.block<3, 3>(6,  6) = I_33 + SO3Math::get_skew_symmetric(-imu.gyro_rps * dt); // 近似
+            PHImat.block<3, 3>(6,  9) = -I_33 * dt; // 近似
 
             // 计算状态转移噪声协方差矩阵Q
             Eigen::Matrix<double, 12, 12> qmat = Eigen::Matrix<double, 12, 12>::Zero();
@@ -285,10 +288,8 @@ private:
                                 2 * model_param_.gyro_bias_std * model_param_.gyro_bias_std / model_param_.gyro_bias_corr_time,
                                 2 * model_param_.accel_bias_std * model_param_.accel_bias_std / model_param_.accel_bias_corr_time,
                             };
-            Eigen::Matrix3d mat[4];
             for(int i = 0; i < 4; i++){
-                mat[i] = Eigen::Vector3d(item[i], item[i], item[i]).asDiagonal();
-                qmat.block<3, 3>(3 * i,  3 * i) = mat[i];
+                qmat.block<3, 3>(3 * i,  3 * i) = item[i] * M3D::Identity();
             }
             Gmat_ = Eigen::Matrix<double, N, 12>::Zero();
             // Gmat_.block<3, 3>( 3, 0) = state_curr.rot.toRotationMatrix();
@@ -422,7 +423,7 @@ private:
                 V3D wp = state_curr_iter.rot * cp + state_curr_iter.pos;
                 p.x = wp.x();
                 p.y = wp.y();
-                p.z = wp.z();
+                p.z = wp.z(); 
                 if(!std::isfinite(wp.x()) || std::isnan(wp.x())){
                     std::cout << "iter: " << iter << " i: " << i << "/" << pcl_features->size() << " cp: " << cp.transpose() << std::endl;
                 }
@@ -474,7 +475,7 @@ private:
                 delta_z_(i) = ef.res;
             }
 
-            double R = 0.0025; // 观测噪声协方差
+            double R = model_param_.R; // 观测噪声协方差
             // 这两矩阵很耗时: 15+ms
             // Eigen::Matrix<double, Eigen::Dynamic, Eigen::Dynamic> Rmat 
             //     = Eigen::MatrixXd::Identity(effect_feature_queue.size(), effect_feature_queue.size()) * R;
@@ -520,7 +521,7 @@ private:
             state_last_iter = state_curr_iter;
         }
         state_last_ = state_curr_iter;
-        Pmat_ = (Eigen::Matrix<double, N, N>::Identity() - Kmat_ * Hmat_) * Pmat_;
+        Pmat_ = (Eigen::Matrix<double, N, N>::Identity() - Kmat_ * Hmat_) * Pmat_;        
     }
 
     void map_update(PointCloud::Ptr& features){

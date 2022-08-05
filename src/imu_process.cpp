@@ -93,13 +93,14 @@ int main(int argc, char** argv)
     // model_param.gyro_bias_corr_time  = 1 * 3600.0;
     // model_param.accel_bias_std       = 50 * 1e-5;           // mGal 1mGal=1e-5Gal
     // model_param.accel_bias_corr_time = 1 * 3600.0;
-
+ 
     model_param.ARW                  = 0.01; 
     model_param.VRW                  = 0.1;  
     model_param.gyro_bias_std        = 0.001; 
     model_param.gyro_bias_corr_time  = 1;
     model_param.accel_bias_std       = 0.01;      
     model_param.accel_bias_corr_time = 1;
+    model_param.R = 0.0025;
 
     model_param.init_t_l_i(-0.09565903, -0.03466711, 0.0407548);
     M3D R_L_I;
