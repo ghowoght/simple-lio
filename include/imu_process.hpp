@@ -182,7 +182,6 @@ private:
     std::vector<PointCloud::Ptr> surf_cloud_queue_;
     PointCloud::Ptr map_surf_cloud_;
     double map_res_ = 0.5;
-    pcl::KdTreeFLANN<PointType> kdtree_;
     PointVector nearest;    // 最近邻搜索结果
     std::vector<PointVector> nearest_queue_;
     int KNN_MATCH_NUM = 5; // K近邻匹配点数
@@ -246,8 +245,7 @@ private:
 
             //////////////// 机械编排 ////////////////
             // 姿态更新
-            M3D R = state_curr.rot.toRotationMatrix() * SO3Math::Exp(imu.gyro_rps * dt);
-            state_curr.rot = QD(R);            
+            state_curr.rot = state_curr.rot * SO3Math::Exp(imu.gyro_rps * dt);
             // 速度更新
             state_curr.vel += (state_curr.rot * imu.accel_mpss - state_curr.grav) * dt;
             // 位置更新
@@ -306,8 +304,8 @@ private:
             //             + Gmat_ * qmat * Gmat_.transpose()) * dt;
             // Gmat_last_ = Gmat_;
 
-            Gmat_.block<3, 3>( 3, 0) = -state_curr.rot.toRotationMatrix() * dt;
-            Gmat_.block<3, 3>( 6, 3) = -SO3Math::J_l(imu.gyro_rps * dt).transpose() * dt;
+            Gmat_.block<3, 3>( 3, 0) = -I_33 * dt; // -state_curr.rot.toRotationMatrix() * dt;
+            Gmat_.block<3, 3>( 6, 3) = -I_33 * dt; // -SO3Math::J_l(imu.gyro_rps * dt).transpose() * dt;
             Gmat_.block<3, 3>( 9, 6) = I_33 * dt;
             Gmat_.block<3, 3>(12, 9) = I_33 * dt;
             auto Qmat = Gmat_ * qmat * Gmat_.transpose();
@@ -399,9 +397,6 @@ private:
     };
     void iterate_update(MeasureData& measure, PointCloud::Ptr& pcl_features){
         // ROS_INFO("map_surf_cloud: %d", map_surf_cloud_->size());
-        // 构建KD-Tree
-        TicToc t_build_kdtree;
-        kdtree_.setInputCloud(map_surf_cloud_); 
 
         // KD-Tree最近邻搜索结果的索引和距离
         std::vector<int> pointSearchInd;
@@ -412,6 +407,7 @@ private:
         auto state_iter_0 = state_queue_.back();    // 迭代更新前的状态
         Eigen::Matrix<double, N, N> Jmat = Eigen::Matrix<double, N, N>::Identity();
         Eigen::Matrix<double, N, N> Jmat_inv = Eigen::Matrix<double, N, N>::Identity();
+        auto Pmat = Pmat_;
         for(int iter = 0; iter < max_iter_times_; iter++){
             std::vector<EffectFeature> effect_feature_queue; // 有效特征点队列
             // ROS_INFO("pcl_features: %d", pcl_features->size());
@@ -465,7 +461,7 @@ private:
                         effect_feature_queue.push_back(EffectFeature{cp, normvec, res});
                 }
             }
-            spdlog::info("effect_feature_queue: {}", effect_feature_queue.size());
+            // spdlog::info("effect_feature_queue: {}", effect_feature_queue.size());
             Hmat_ = Eigen::MatrixXd::Zero(effect_feature_queue.size(), N);
             delta_z_ = Eigen::VectorXd::Zero(effect_feature_queue.size());
             for(int i = 0; i < effect_feature_queue.size(); i++){
@@ -476,11 +472,6 @@ private:
             }
 
             double R = model_param_.R; // 观测噪声协方差
-            // 这两矩阵很耗时: 15+ms
-            // Eigen::Matrix<double, Eigen::Dynamic, Eigen::Dynamic> Rmat 
-            //     = Eigen::MatrixXd::Identity(effect_feature_queue.size(), effect_feature_queue.size()) * R;
-            // Eigen::Matrix<double, Eigen::Dynamic, Eigen::Dynamic> Rmat_inv 
-            //     = Eigen::MatrixXd::Identity(effect_feature_queue.size(), effect_feature_queue.size()) / R;
 
             delta_x_.block<3, 1>( 0, 0) = state_curr_iter.pos - state_iter_0.pos;
             delta_x_.block<3, 1>( 3, 0) = state_curr_iter.vel - state_iter_0.vel;
@@ -494,12 +485,12 @@ private:
             
             auto Amat_inv = SO3Math::J_l_inv(delta_x_.block<3, 1>( 6, 0));
             Jmat.block<3, 3>(6, 6) = Amat_inv.transpose();
-            auto Amat = SO3Math::J_l(delta_x_.block<3, 1>( 6, 0));
-            Jmat_inv.block<3, 3>(6, 6) = Amat.transpose();
-            Pmat_ = Jmat_inv * Pmat_ * Jmat_inv.transpose();
+            auto Amat = SO3Math::J_l(-delta_x_.block<3, 1>( 6, 0));
+            Jmat_inv.block<3, 3>(6, 6) = Amat;//.transpose();
+            Pmat = Jmat_inv * Pmat_ * Jmat_inv.transpose();
 
             // 卡尔曼增益
-            Kmat_ = (Hmat_.transpose() * Hmat_ + (Pmat_ / R).inverse()).inverse() * Hmat_.transpose();
+            Kmat_ = (Hmat_.transpose() * Hmat_ + (Pmat / R).inverse()).inverse() * Hmat_.transpose();
             // Kmat_ = Pmat_ * Hmat_.transpose() * (Hmat_ * Pmat_ * Hmat_.transpose() + Rmat).inverse();
             // std::cout << "Kmat_: " << Kmat_ << std::endl;
 
@@ -510,10 +501,6 @@ private:
             state_curr_iter.pos = state_last_iter.pos + delta.block<3, 1>( 0, 0);
             state_curr_iter.vel = state_last_iter.vel + delta.block<3, 1>( 3, 0);
             state_curr_iter.rot = state_last_iter.rot.toRotationMatrix() * SO3Math::Exp(delta.block<3, 1>( 6, 0));
-            double rot_norm = state_curr_iter.rot.x() * state_curr_iter.rot.x()
-                            + state_curr_iter.rot.y() * state_curr_iter.rot.y()
-                            + state_curr_iter.rot.z() * state_curr_iter.rot.z() 
-                            + state_curr_iter.rot.w() * state_curr_iter.rot.w();
             state_curr_iter.rot.normalize(); // ?? 理论上不需要再进行归一化
             state_curr_iter.bg = state_last_iter.bg + delta.block<3, 1>( 9, 0);
             state_curr_iter.ba = state_last_iter.ba + delta.block<3, 1>(12, 0);
@@ -521,7 +508,7 @@ private:
             state_last_iter = state_curr_iter;
         }
         state_last_ = state_curr_iter;
-        Pmat_ = (Eigen::Matrix<double, N, N>::Identity() - Kmat_ * Hmat_) * Pmat_;        
+        Pmat_ = (Eigen::Matrix<double, N, N>::Identity() - Kmat_ * Hmat_) * Pmat;        
     }
 
     void map_update(PointCloud::Ptr& features){
@@ -533,7 +520,7 @@ private:
             V3D pb((*features)[i].x, (*features)[i].y, (*features)[i].z);
             V3D pw = state_last_.rot * pb + state_last_.pos; // 转换到世界坐标系下
 
-            if(pb.norm() > 150) continue;
+            if(pb.norm() > 200) continue;
 
             PointType p;
             p.x = pw.x();
@@ -674,11 +661,6 @@ public:
 
         // 发布地图
         sensor_msgs::PointCloud2 map_msg;
-        // PointVector ().swap(ikd_tree_->PCL_Storage);
-        // ikd_tree_->flatten(ikd_tree_->Root_Node, ikd_tree_->PCL_Storage, NOT_RECORD);
-        // map_surf_cloud_->clear();
-        // map_surf_cloud_->points = ikd_tree_->PCL_Storage;
-        
         pcl::toROSMsg(*map_surf_cloud_, map_msg);
         map_msg.header.stamp = ros::Time(measure.pcl_end_time);
         map_msg.header.frame_id = "map";
@@ -705,8 +687,6 @@ public:
         if(1){
             auto euler = SO3Math::quat2euler(state_last_.rot);
             euler = euler * 180 / M_PI;
-            // std::cout << std::setprecision(15) << "time: " << state_last_.time << " euler: " << euler.transpose()<< std::endl;
-
             trajctory_writer_->write_txt(state_last_.to_string());
         }
     }
