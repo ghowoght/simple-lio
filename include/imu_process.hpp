@@ -24,7 +24,6 @@
 #include <queue>
 
 #include "so3_math.hpp"
-#include "scan_registration.hpp"
 #include "tictoc.hpp"
 #include "file_helper.hpp"
 #include "ikd-Tree/ikd_Tree.h"
@@ -40,6 +39,7 @@
 
 using PointType = pcl::PointXYZINormal;
 using PointCloud = pcl::PointCloud<PointType>;
+using PointCloudXYZI = pcl::PointCloud<PointType>;
 using V3D = Eigen::Vector3d;
 using M3D = Eigen::Matrix3d;
 using QD = Eigen::Quaterniond;
@@ -176,7 +176,7 @@ private:
     Eigen::Matrix<double, Eigen::Dynamic, N> Hmat_;
     Eigen::Matrix<double, N, Eigen::Dynamic> Kmat_;
 
-    int max_iter_times_ = 5;
+    int max_iter_times_ = 5; 
 
     // 地图相关
     std::vector<PointCloud::Ptr> surf_cloud_queue_;
@@ -482,7 +482,7 @@ private:
             delta_x_.block<3, 1>(15, 0) = state_curr_iter.grav - state_iter_0.grav;
 
             auto dx_new = delta_x_;
-            
+             
             auto Amat_inv = SO3Math::J_l_inv(delta_x_.block<3, 1>( 6, 0));
             Jmat.block<3, 3>(6, 6) = Amat_inv.transpose();
             auto Amat = SO3Math::J_l(-delta_x_.block<3, 1>( 6, 0));
@@ -579,10 +579,8 @@ public:
         return false;
     }
     void process(MeasureData& measure){
-        // 特征提取
-        ScanRegistration scan_registration;
-        scan_registration.feature_extract(measure.cloud);
-        auto& cloud_surf = scan_registration.pointSurf;
+        
+        auto& cloud_surf = measure.cloud;
 
         if(!is_initialized_){
             // 转换到惯性系
@@ -622,15 +620,23 @@ public:
         forward_propagation(measure);
         // 反向传播
         backward_propagation(measure);
-        // 点云运动补偿
+        // 点云运动补偿，转换到该帧结束时的惯导坐标系下
         PointCloud::Ptr pcl_out = boost::make_shared<PointCloud>();
         point_cloud_undistort(measure, cloud_surf, pcl_out);
+        // 降采样
+        pcl::VoxelGrid<PointType> surf_filter;
+        double filter_res = 0.8;
+        surf_filter.setLeafSize(filter_res, filter_res, filter_res);
+        surf_filter.setInputCloud(pcl_out);
+        PointCloudXYZI::Ptr pcl_out_filtered(new PointCloudXYZI);
+        surf_filter.filter(*pcl_out_filtered);
+        // ROS_INFO("pcl out size: %d", pcl_out_filtered->size());
         // 点云迭代更新
         TicToc t_update;
-        iterate_update(measure, pcl_out);
+        iterate_update(measure, pcl_out_filtered);
         ROS_INFO("update time: %f", t_update.toc());
         // 地图增量更新
-        map_update(pcl_out);
+        map_update(pcl_out_filtered);
         // 发布坐标转换
         odom_trans.header.stamp = ros::Time(measure.pcl_end_time);
         odom_trans.header.frame_id = "map";
@@ -670,10 +676,8 @@ public:
         PointCloud::Ptr points_world = boost::make_shared<PointCloud>();
         for(int i = 0; i < pcl_out->size(); i++){
             V3D pb((*pcl_out)[i].x, (*pcl_out)[i].y, (*pcl_out)[i].z);
-            // V3D pb = model_param_.R_L_I * pl + model_param_.T_L_I; // 转换到惯性系
             V3D pw = state_last_.rot * pb + state_last_.pos; // 转换到世界坐标系下
-            if(pb.norm() > 150) continue;
-            PointType p;
+            PointType p = (*pcl_out)[i];
             p.x = pw.x();
             p.y = pw.y();
             p.z = pw.z();
