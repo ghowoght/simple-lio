@@ -17,7 +17,6 @@ int main(int argc, char** argv)
     ros::NodeHandle nh;
 
     std::queue<MeasureData> measure_queue;
-    MeasureData meas;
     std::queue<sensor_msgs::ImuConstPtr> imu_queue;
     std::queue<sensor_msgs::PointCloud2ConstPtr> cloud_queue;
 
@@ -47,6 +46,7 @@ int main(int argc, char** argv)
             cloud_queue.pop();            
             auto imu_msg = imu_queue.front();
             auto imu_time = imu_msg->header.stamp.toSec();
+            MeasureData meas;
             while(imu_time <= pcl_end_time)
             {   
                 imu_queue.pop();
@@ -70,9 +70,7 @@ int main(int argc, char** argv)
             }
             meas.pcl_beg_time = pcl_beg_time;
             meas.pcl_end_time = pcl_end_time;
-            PointCloud::Ptr cloud = boost::make_shared<PointCloud>();
-            pcl::fromROSMsg(*pcl_msg, *cloud);
-            meas.cloud = cloud;
+            pcl::fromROSMsg(*pcl_msg, *meas.cloud);
             // 将数据打包到队列中
             measure_queue.push(meas); 
             meas.cloud = nullptr;
@@ -100,6 +98,7 @@ int main(int argc, char** argv)
     model_param.gyro_bias_corr_time  = 1;
     model_param.accel_bias_std       = 0.01;      
     model_param.accel_bias_corr_time = 1;
+
     model_param.R = 0.0025;
 
     model_param.init_t_l_i(-0.09565903, -0.03466711, 0.0407548);
@@ -112,13 +111,13 @@ int main(int argc, char** argv)
 
     while(ros::ok()){
         if(!measure_queue.empty()){
-            auto&& meas = measure_queue.front();
+            auto& meas = measure_queue.front();
             // ROS_INFO("meas size: %d, imu_beg_time: %f, pcl_beg_time: %f", measure_queue.size(), meas.imu_queue.front().time, meas.pcl_beg_time);
             // ROS_INFO("meas size: %d, imu_end_time: %f, pcl_end_time: %f", measure_queue.size(), meas.imu_queue.back().time, meas.pcl_end_time);
             // ROS_INFO("--------------------");
             TicToc t_process;
             imu_process.process(meas);
-            ROS_INFO("process time: %f", t_process.toc());
+            ROS_INFO("total process time: %f", t_process.toc());
             ROS_INFO("--------------------");
             measure_queue.pop();
         }
