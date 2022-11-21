@@ -86,13 +86,16 @@ struct StateEKF{
     }
 
     inline std::string to_string() const{
-        V3D euler = SO3Math::quat2euler(rot);
-        return fmt::format("{} {} {} {} {} {} {} {} {} {}\n", 
-                            time,
-                            pos.x(), pos.y(), pos.z(),
-                            vel.x(), vel.y(), vel.z(),
-                            euler[0], euler[1], euler[2]
-                            );
+        // 将时间转换为周内秒
+        int GPS_LEAP_SECOND = 18; 
+        double second_gps = time + GPS_LEAP_SECOND - 315964800;
+        int week = floor(second_gps / 604800);
+        double sow = second_gps - week * 604800;
+        return fmt::format("{} {} {} {} {} {} {} {}\n", 
+                        sow,
+                        pos.x(), pos.y(), pos.z(),
+                        rot.x(), rot.y(), rot.z(), rot.w()
+                        );
     }
 };
 
@@ -215,7 +218,7 @@ public:
 
         // logger_ = spdlog::basic_logger_st("trajctory", "/home/ghowoght/workspace/lidar_ws/src/simple_lio/logger.txt");
 
-        // trajctory_writer_ = FileWriter::create("/home/ghowoght/workspace/lidar_ws/src/simple_lio/trajctory.txt");
+        // trajctory_writer_ = FileWriter::create("/home/ghowoght/workspace/lidar_ws2/src/simple_lio/result/trajctory.txt");
 
         surf_frame_ds_filter_.setLeafSize(surf_frame_ds_res_, surf_frame_ds_res_, surf_frame_ds_res_);
 
@@ -352,8 +355,11 @@ private:
             while(time_curr_point < state_bp_queue_[idx + 1].time){
                 idx++;
             }
-            if(time_curr_point > state_bp_queue_[idx + 1].time){
-                auto imu = measure.imu_queue[measure.imu_queue.size() - 1 - idx];
+            // 当前点的时间在idx和idx+1之间
+            if(idx + 1 < state_bp_queue_.size() 
+                && time_curr_point > state_bp_queue_[idx + 1].time){
+                
+                auto imu = measure.imu_queue[(int)measure.imu_queue.size() - 1 - idx];
                 double dt = state_bp_queue_[idx].time - time_curr_point;
                 auto state_curr = state_bp_queue_[idx];
                 M3D R = state_curr.rot.toRotationMatrix() * SO3Math::Exp(-imu.gyro_rps * dt);
@@ -368,13 +374,18 @@ private:
                 p_to_add.x = p_b_end.x();
                 p_to_add.y = p_b_end.y();
                 p_to_add.z = p_b_end.z();
+
             }
-            if(std::isfinite(p_to_add.x) && std::isfinite(p_to_add.y) && std::isfinite(p_to_add.z)){
-                pcl_out->push_back(p_to_add);
+            else if(idx + 1 >= state_bp_queue_.size()){
+                V3D p_l_i((*pcl_in)[i].x, (*pcl_in)[i].y, (*pcl_in)[i].z);
+                V3D p_b_i = model_param_.R_L_I * p_l_i + model_param_.T_L_I; // 转换到惯导坐标系下
+                V3D p_b_end = state_last_.rot * p_b_i + state_last_.pos;      // 转换到扫描结束时刻的惯导坐标系下
+                
+                p_to_add.x = p_b_end.x();
+                p_to_add.y = p_b_end.y();
+                p_to_add.z = p_b_end.z();
             }
-            else{
-                std::cout << "p_to_add: " << p_to_add.x << std::endl;
-            }
+            pcl_out->push_back(p_to_add);
         }
     }
 
@@ -385,10 +396,6 @@ private:
     };
     void iterate_update(MeasureData& measure, PointCloud::Ptr& pcl_features){
         // ROS_INFO("map_surf_cloud: %d", map_surf_cloud_->size());
-
-        // KD-Tree最近邻搜索结果的索引和距离
-        std::vector<int> pointSearchInd;
-        std::vector<float> pointSearchSqDis;
 
         auto state_curr_iter = state_queue_.back(); // 当前迭代时刻的状态
         auto state_last_iter = state_queue_.back(); // 上一迭代时刻的状态
@@ -422,11 +429,12 @@ private:
                 if(is_converge){
                     // 最近邻搜索
                     TicToc t_kdtree;
+                    std::vector<float> pointSearchSqDis; // 最近邻搜索结果的距离，从小到大排列
                     ikd_tree_->Nearest_Search(p, KNN_MATCH_NUM, nearest, pointSearchSqDis);
                     time_k_search += t_kdtree.toc();
 
                     // 最近邻都在指定范围内
-                    if(pointSearchSqDis[KNN_MATCH_NUM - 1] < 5 
+                    if(pointSearchSqDis[KNN_MATCH_NUM - 1] < 5.0 
                         && nearest.size() >= KNN_MATCH_NUM){
                             is_surf_list_[i] = true;
                     }
@@ -444,7 +452,7 @@ private:
                     A(k, 2) = nearest[k].z;
                 }
                 V3D normvec = A.colPivHouseholderQr().solve(b); // 求解法向量
-                double norm = normvec.norm();
+                double norm = normvec.norm(); // 法向量模长
                 normvec.normalize(); // 法向量归一化
 
                 Eigen::Vector4d abcd;
@@ -549,12 +557,13 @@ private:
             p.y = pw.y();
             p.z = pw.z();
 
-            PointType mid_point;
+            PointType mid_point; // 当前点所在体素的中心点
             mid_point.x = floor(pw.x() / map_res_) * map_res_ + map_res_ / 2;
             mid_point.y = floor(pw.y() / map_res_) * map_res_ + map_res_ / 2;
             mid_point.z = floor(pw.z() / map_res_) * map_res_ + map_res_ / 2;
             V3D p_mid(mid_point.x, mid_point.y, mid_point.z);
-            double dist = (pw - p_mid).norm();
+            double dist = (pw - p_mid).norm(); // 到体素中心的距离
+            // 如果最近邻到该体素中心的距离大于阈值，则认为该点是新的特征点，不需要降采样
             if(fabs(nearest[0].x - mid_point.x) > map_res_ / 2
                 && fabs(nearest[0].y - mid_point.y) > map_res_ / 2
                 && fabs(nearest[0].z - mid_point.z) > map_res_ / 2){
@@ -562,6 +571,7 @@ private:
                 continue;
             }
             bool need_add = true;
+            // 如果有最近邻在体素中，而且距离中心更近，则不添加该点
             for(int k = 0; k < KNN_MATCH_NUM; k++){
                 if(nearest.size() < KNN_MATCH_NUM)
                     break;
@@ -706,8 +716,6 @@ public:
 
         // 将结果保存为文本文件
         if(0){
-            auto euler = SO3Math::quat2euler(state_last_.rot);
-            euler = euler * 180 / M_PI;
             trajctory_writer_->write_txt(state_last_.to_string());
         }
     }
