@@ -41,7 +41,6 @@
 
 using PointType = pcl::PointXYZINormal;
 using PointCloud = pcl::PointCloud<PointType>;
-using PointCloudXYZI = pcl::PointCloud<PointType>;
 using V3D = Eigen::Vector3d;
 using M3D = Eigen::Matrix3d;
 using QD = Eigen::Quaterniond;
@@ -627,7 +626,7 @@ public:
             surf_cloud_queue_.push_back(cloud_surf);
             *map_surf_cloud_ += *cloud_surf;
 
-            PointCloudXYZI::Ptr surf_filtered(new PointCloudXYZI);
+            PointCloud::Ptr surf_filtered(new PointCloud);
             pcl::VoxelGrid<PointType> sor;
             sor.setInputCloud(map_surf_cloud_);
             sor.setLeafSize(map_res_, map_res_, map_res_);
@@ -659,7 +658,7 @@ public:
         point_cloud_undistort(measure, cloud_surf, pcl_out);
         // 降采样
         surf_frame_ds_filter_.setInputCloud(pcl_out);
-        PointCloudXYZI::Ptr pcl_out_filtered(new PointCloudXYZI);
+        PointCloud::Ptr pcl_out_filtered(new PointCloud);
         surf_frame_ds_filter_.filter(*pcl_out_filtered);
         // ROS_INFO("pcl out size: %d", pcl_out_filtered->size());
         // 点云迭代更新
