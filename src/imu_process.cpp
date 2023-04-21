@@ -16,11 +16,19 @@ int main(int argc, char** argv)
     ros::init(argc, argv, "imu_process");
     ros::NodeHandle nh;
 
+    ros::NodeHandle private_nh("~");
+    std::string config_file;
+    private_nh.param("config_file", config_file, std::string(""));
+    ROS_INFO("config_file: %s", config_file.c_str());
+    YAML::Node config = YAML::LoadFile(config_file);
+
+    std::string imu_topic = config["topic"]["imu"].as<std::string>();
+
     std::queue<MeasureData> measure_queue;
     std::queue<sensor_msgs::ImuConstPtr> imu_queue;
     std::queue<sensor_msgs::PointCloud2ConstPtr> cloud_queue;
 
-    ros::Subscriber imu_sub = nh.subscribe<sensor_msgs::Imu>("/imu0", 100, [&](const sensor_msgs::ImuConstPtr & msg)
+    ros::Subscriber imu_sub = nh.subscribe<sensor_msgs::Imu>(imu_topic, 100, [&](const sensor_msgs::ImuConstPtr & msg)
     {   
         imu_queue.push(msg);
 
@@ -62,6 +70,7 @@ int main(int argc, char** argv)
                 ImuData imu;
                 imu.time = imu_msg->header.stamp.toSec();
                 imu.accel_mpss << accel_mpss.x, accel_mpss.y, accel_mpss.z;
+                // imu.accel_mpss *= 9.81; // LiLi-OM数据
                 imu.gyro_rps   << gyro_rps.x, gyro_rps.y, gyro_rps.z;
                 meas.imu_queue.push_back(imu);
 
@@ -85,29 +94,40 @@ int main(int argc, char** argv)
     ROS_INFO("imu_process start");
 
     ModelParam model_param;
-    // model_param.ARW                  = 0.1 / 60.0 * SO3Math::D2R;    // deg/sqrt(hr)
-    // model_param.VRW                  = 0.1 / 60.0;          // m/s/sqrt(hr)
-    // model_param.gyro_bias_std        = 50 * SO3Math::D2R / 3600.0;   // deg/hr
-    // model_param.gyro_bias_corr_time  = 1 * 3600.0;
-    // model_param.accel_bias_std       = 50 * 1e-5;           // mGal 1mGal=1e-5Gal
-    // model_param.accel_bias_corr_time = 1 * 3600.0;
- 
-    model_param.ARW                  = 0.01; 
-    model_param.VRW                  = 0.1;  
-    model_param.gyro_bias_std        = 0.001; 
-    model_param.gyro_bias_corr_time  = 1;
-    model_param.accel_bias_std       = 0.01;      
-    model_param.accel_bias_corr_time = 1;
 
-    model_param.R = 0.0025;
+    // 读取imu & lidar参数
+    model_param.ARW                  = config["imu_params"]["ARW"].as<double>(); 
+    model_param.VRW                  = config["imu_params"]["VRW"].as<double>();  
+    model_param.gyro_bias_std        = config["imu_params"]["gyro_bias_std"].as<double>();
+    model_param.gyro_bias_corr_time  = config["imu_params"]["gyro_bias_corr_time"].as<double>(); 
+    model_param.accel_bias_std       = config["imu_params"]["accel_bias_std"].as<double>();      
+    model_param.accel_bias_corr_time = config["imu_params"]["accel_bias_corr_time"].as<double>();
+    model_param.R                    = config["lidar_params"]["R_plane"].as<double>();
 
-    model_param.init_t_l_i(-0.09565903, -0.03466711, 0.0407548);
-    M3D R_L_I;
-    R_L_I << 0.99921203,  0.03962574, -0.00226486,
-             0.03961853, -0.99920993, -0.00314573,
-            -0.00238773,  0.00305353, -0.99999249;
-    model_param.init_r_l_i(R_L_I);
-    IMUProcess imu_process(model_param, nh);
+    // 读取外参
+    std::vector<double> r_l_i = config["lidar_params"]["r_l_i"].as<std::vector<double>>();
+    if(r_l_i.size() == 4) {
+        // 四元数
+        QD q_l_i(r_l_i[0], r_l_i[1], r_l_i[2], r_l_i[3]);
+        model_param.init_r_l_i(q_l_i);
+    } else if(r_l_i.size() == 9) {
+        // 旋转矩阵
+        M3D R_L_I;
+        R_L_I << r_l_i[0], r_l_i[1], r_l_i[2],
+                 r_l_i[3], r_l_i[4], r_l_i[5],
+                 r_l_i[6], r_l_i[7], r_l_i[8];
+        model_param.init_r_l_i(R_L_I);
+    } else {
+        ROS_ERROR("r_l_i size error");
+    }
+    std::vector<double> t_l_i = config["lidar_params"]["t_l_i"].as<std::vector<double>>();
+    if(t_l_i.size() == 3) {
+        model_param.init_t_l_i(t_l_i[0], t_l_i[1], t_l_i[2]);
+    } else {
+        ROS_ERROR("t_l_i size error");
+    }
+
+    IMUProcess imu_process(model_param, private_nh);
 
     while(ros::ok()){
         if(!measure_queue.empty()){

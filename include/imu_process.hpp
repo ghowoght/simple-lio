@@ -25,6 +25,7 @@
 #include <vector>
 #include <queue>
 #include <algorithm>
+#include <filesystem>
 
 #include "so3_math.hpp"
 #include "tictoc.hpp"
@@ -37,6 +38,8 @@
 
 #include <spdlog/spdlog.h>
 #include <spdlog/sinks/basic_file_sink.h>
+
+#include <yaml-cpp/yaml.h>
 
 #define N 18 // 状态维度
 
@@ -149,8 +152,11 @@ struct ModelParam{
         R_L_I.z()=cos(pitch/2)*sin(yaw/2)*cos(roll/2)-sin(pitch/2)*cos(yaw/2)*sin(roll/2);
         R_L_I.w()=cos(pitch/2)*cos(yaw/2)*cos(roll/2)-sin(pitch/2)*sin(yaw/2)*sin(roll/2);
     }
-    void init_r_l_i(M3D& R_L_I_){
+    void init_r_l_i(const M3D& R_L_I_){
         R_L_I = QD(R_L_I_);
+    }
+    void init_r_l_i(const QD& R_L_I_){
+        R_L_I = R_L_I_;
     }
     void init_t_l_i(double x, double y, double z){
         T_L_I(0) = x;
@@ -204,7 +210,9 @@ private:
     KD_TREE<PointType>::Ptr ikd_tree_;
 
     // 定位结果
+    std::string result_dir_;
     std::shared_ptr<spdlog::logger> logger_;
+    bool is_save_traj_ = false;
     FileWriterPtr trajctory_writer_;
 
 
@@ -213,17 +221,60 @@ public:
     IMUProcess()=default;
     IMUProcess(const ModelParam& model_param, ros::NodeHandle& nh) : model_param_(model_param), nh_(nh){
 
+        ros::NodeHandle private_nh("~");
+        std::string config_file;
+        private_nh.param("config_file", config_file, std::string(""));
+        YAML::Node config = YAML::LoadFile(config_file);
+
+        is_save_traj_ = config["result"]["enable"].as<bool>();
+        ROS_INFO("save result: %d", is_save_traj_);
+        if(is_save_traj_){
+            // 生成存放结果的目录 根目录/数据序号_yyyymmdd_hhmmss
+            auto generate_file_path = [](const std::string& path) {
+                auto get_two_digit = [](int n) {
+                    std::stringstream ss;
+                    ss << std::setw(2) << std::setfill('0') << n;
+                    return ss.str();
+                };
+                time_t tt = time(NULL);
+                struct tm* t = localtime(&tt);
+                std::stringstream ss;
+                ss << path << t->tm_year + 1900
+                        << get_two_digit(t->tm_mon + 1) 
+                        << get_two_digit(t->tm_mday) << "_" 
+                        << get_two_digit(t->tm_hour) 
+                        << get_two_digit(t->tm_min) 
+                        << get_two_digit(t->tm_sec);
+                return ss.str();
+            };
+            result_dir_ = generate_file_path(config["result"]["save_path"].as<std::string>() + "/");
+            // 创建目录
+            std::filesystem::create_directories(result_dir_);
+            ROS_INFO("result_dir: %s", result_dir_.c_str());
+            // 将配置文件复制到结果目录
+            std::filesystem::copy_file(config_file, result_dir_ + "/config.yaml", std::filesystem::copy_options::overwrite_existing);
+            std::string traj_path = result_dir_ + "/trajctory.txt";
+            trajctory_writer_ = FileWriter::create(traj_path);
+        }
+
+        // 读取参数
+        surf_frame_ds_res_ = config["surf_map"]["res"].as<double>();
+        map_res_ = config["surf_map"]["res"].as<double>();
+        ROS_INFO("surf_frame_ds_res_: %f", surf_frame_ds_res_);
+        sample_interval_ = config["lidar_params"]["sample_interval"].as<int>();
+        ROS_INFO("sample_interval_: %d", sample_interval_);
+        max_iter_times_ = config["max_iter_times"].as<int>();
+        ROS_INFO("max_iter_times_: %d", max_iter_times_);
+
+        // 初始化发布器
         pub_surf_map    = nh_.advertise<sensor_msgs::PointCloud2>("/surf_map", 1);
         pub_surf_cloud  = nh_.advertise<sensor_msgs::PointCloud2>("/surf_cloud", 1);
         pub_traj        = nh_.advertise<nav_msgs::Path>("/traj/local", 10);
 
-        // logger_ = spdlog::basic_logger_st("trajctory", "/home/ghowoght/workspace/lidar_ws/src/simple_lio/logger.txt");
-
-        trajctory_writer_ = FileWriter::create("/home/ghowoght/trajctory.txt");
-
         surf_frame_ds_filter_.setLeafSize(surf_frame_ds_res_, surf_frame_ds_res_, surf_frame_ds_res_);
 
         map_surf_cloud_ = boost::make_shared<PointCloud>();
+        // 初始化ikd-tree
         ikd_tree_ = std::make_shared<KD_TREE<PointType>>(); // delete_param, balance_param, box_length
         ikd_tree_->set_downsample_param(map_res_);
         
@@ -235,6 +286,8 @@ public:
     }
     ~IMUProcess(){
         spdlog::drop_all();
+        if(is_save_traj_)
+            ROS_INFO("result save to: %s", result_dir_);
     }
 
 private:
@@ -755,7 +808,7 @@ public:
         pub_surf_cloud.publish(cloud_msg);
 
         // 将结果保存为文本文件
-        if(1){
+        if(is_save_traj_){
             for(int i = 1; i < state_queue_.size() - 1;){
                 trajctory_writer_->write_txt(state_queue_[i].to_string());
                 i += 1;

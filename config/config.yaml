@@ -1,0 +1,29 @@
+topic:
+  imu: /livox/imu
+  lidar: /livox/lidar
+
+imu_params:
+  ARW: 0.003 
+  VRW: 0.4
+  gyro_bias_std: 0.01
+  gyro_bias_corr_time: 1
+  accel_bias_std: 0.01      
+  accel_bias_corr_time: 1
+
+lidar_params:
+  R_plane: 0.01               # 平面观测噪声方差
+  sample_interval: 5          # 抽样间隔
+  t_l_i: [ 0, 0, 0]
+  r_l_i: [ 1, 0, 0,
+          0, 1, 0,
+          0, 0, 1]
+
+# IEKF相关参数
+max_iter_times: 10           # 最大迭代次数
+
+surf_map:
+  res: 0.5                    # 地图分辨率 (m)
+
+result:
+  enable: true                # 是否保存结果
+  save_path: /home/ghowoght/workspace/lidar_ws/src/simple_lio/result # 保存路径

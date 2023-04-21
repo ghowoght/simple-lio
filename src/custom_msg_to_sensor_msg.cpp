@@ -14,6 +14,8 @@
 #include <pcl/point_types.h>
 #include <pcl_conversions/pcl_conversions.h>
 
+#include <yaml-cpp/yaml.h>
+
 typedef pcl::PointXYZINormal PointType;
 typedef pcl::PointCloud<PointType> PointCloudXYZI;
 
@@ -22,14 +24,21 @@ typedef pcl::PointCloud<PointType> PointCloudXYZI;
 int main(int argc, char** argv){
     ros::init(argc, argv, "CustomMsg2SensorMsg");
 
+    ros::NodeHandle private_nh("~");
+    std::string config_file;
+    private_nh.param("config_file", config_file, std::string(""));
+    ROS_INFO("config_file: %s", config_file.c_str());
+    YAML::Node config = YAML::LoadFile(config_file);
+    // 获取lidar_topic
+    std::string lidar_topic = config["topic"]["lidar"].as<std::string>();
+    // 创建发布器    
     ros::NodeHandle nh;
-
     ros::Publisher pcl_msgs_pub = nh.advertise<sensor_msgs::PointCloud2>("/livox/lidar/sensor_pointcloud2", 10);
 
     uint8_t TO_MERGE_CNT = 1;
     std::vector<livox_ros_driver::CustomMsgConstPtr> livox_datas; // 消息缓存，到达一定数量时合并成一个PCL消息
     ros::Subscriber custom_msgs_sub = nh.subscribe<livox_ros_driver::CustomMsg>(
-                "/livox/lidar", 
+                lidar_topic, 
                 10, 
                 [&](const livox_ros_driver::CustomMsgConstPtr& msgs){
         livox_datas.push_back(msgs);
@@ -47,22 +56,22 @@ int main(int argc, char** argv){
                 pt.x = livox_msgs->points[i].x;
                 pt.y = livox_msgs->points[i].y;
                 pt.z = livox_msgs->points[i].z;
-                pt.intensity    = livox_msgs->points[i].line // 整数是线数
-                                + livox_msgs->points[i].reflectivity / 10000.0; // ??? 小数是反射率?
+                pt.intensity    = livox_msgs->points[i].reflectivity / 10000.0; // 小数是反射率
                 pt.curvature = (livox_msgs->points[i].offset_time / (float)time_end); // 该点时刻在该次扫描时间段的位置
                 points_pcl.push_back(pt);
             }
         }        
 
+        // ROS_INFO("timestamp: %ld", livox_datas[0]->timebase);
         uint64_t timebase_ns = livox_datas[0]->timebase;
         ros::Time timestamp;
         timestamp.fromNSec(timebase_ns);
 
         sensor_msgs::PointCloud2 pcl_msgs;
         pcl::toROSMsg(points_pcl, pcl_msgs);
-        pcl_msgs.header.stamp = timestamp;
+        // pcl_msgs.header.stamp = timestamp;
+        pcl_msgs.header.stamp = livox_datas[0]->header.stamp;
         pcl_msgs.header.frame_id = "livox";
-
         pcl_msgs_pub.publish(pcl_msgs);
         livox_datas.clear(); // 清空缓存区
     });
