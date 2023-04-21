@@ -1,11 +1,15 @@
 <launch>
     <param name="use_sim_time" value="true"/>
 
-    <node pkg="simple_lio" type="custom_msg_to_sensor_msg" name="custom_msg_to_sensor_msg"/>
+    <node pkg="simple_lio" type="custom_msg_to_sensor_msg" name="custom_msg_to_sensor_msg" output="screen">
+        <param name="config_file" value="$(find simple_lio)/config/config.yaml"/>
+    </node>
 
-    <node pkg="simple_lio" type="imu_process" name="imu_process" output="screen"/>
+    <node pkg="simple_lio" type="imu_process" name="imu_process" output="screen">
+        <param name="config_file" value="$(find simple_lio)/config/config.yaml"/>
+    </node>
     
-    <!-- <node pkg="rosbag" type="play" name="rosbag" args="/home/ghowoght/Data_Sata/bag/20221107/04/2022-11-07-16-26-34.bag -r 4"/> -->
+    <node pkg="rosbag" type="play" name="rosbag" args="/media/ghowoght/T7/r3live/hku_main_building.bag -r 5" output="screen"/>
 
     <node launch-prefix="nice" pkg="rviz" type="rviz" name="rviz" args="-d $(find simple_lio)/rviz/simple_lio.rviz" />
     

@@ -184,6 +184,8 @@ private:
     // kalman相关
     Eigen::Matrix<double, N, 1> delta_x_; // p v phi bg ba g
     Eigen::Matrix<double, N, N> Pmat_;
+    Eigen::Matrix<double, 12, 12>  qmat_;
+    Eigen::Matrix<double, N, N> PHImat_;
 
     Eigen::Matrix<double, N, 12> Gmat_; // 噪声输入映射矩阵 noise-input mapping matrix
     Eigen::Matrix<double, N, 12> Gmat_last_;
@@ -278,11 +280,27 @@ public:
         ikd_tree_ = std::make_shared<KD_TREE<PointType>>(); // delete_param, balance_param, box_length
         ikd_tree_->set_downsample_param(map_res_);
         
+        // 初始化P
         state_last_ = StateEKF();
-        Pmat_ = Eigen::Matrix<double, N, N>::Identity();
-        Pmat_(6,6) = Pmat_(7,7) = Pmat_(8,8) = 0.00001;
-        Pmat_(9,9) = Pmat_(10,10) = Pmat_(11,11) = 0.00001;
-        Pmat_(15,15) = Pmat_(16,16) = Pmat_(17,17) = 0.00001;
+        Pmat_.setIdentity();
+        M3D Imat = M3D::Identity();
+        Pmat_.block<3, 3>(0, 0) = M3D::Zero();
+        Pmat_.block<3, 3>(3, 3) = Imat * 0.01;
+        Pmat_.block<3, 3>(6, 6) = Imat * 0.00001;
+        Pmat_.block<3, 3>(9, 9) = Imat * 0.00001;
+        Pmat_.block<3, 3>(12, 12) = Imat * 0.00001;
+        Pmat_.block<3, 3>(15, 15) = Imat * 0.00001;
+
+        // 初始化q
+        qmat_.setZero();
+        double item[] = {   model_param_.VRW * model_param_.VRW,
+                            model_param_.ARW * model_param_.ARW,
+                            2 * model_param_.gyro_bias_std * model_param_.gyro_bias_std / model_param_.gyro_bias_corr_time,
+                            2 * model_param_.accel_bias_std * model_param_.accel_bias_std / model_param_.accel_bias_corr_time,
+                        };
+        for(int i = 0; i < 4; i++){
+            qmat_.block<3, 3>(3 * i,  3 * i) = item[i] * M3D::Identity();
+        }
     }
     ~IMUProcess(){
         spdlog::drop_all();
@@ -318,41 +336,31 @@ private:
             //////////////// 噪声传播 ////////////////
             auto I_33 = Eigen::Matrix3d::Identity();
             // 计算状态转移矩阵Φ
-            Eigen::Matrix<double, N, N> PHImat = Eigen::Matrix<double, N, N>::Identity();
-
+            PHImat_.setIdentity();
             // p
-            PHImat.block<3, 3>(0,  3) = I_33 * dt;  
+            PHImat_.block<3, 3>(0,  3) = I_33 * dt;  
             // v
-            PHImat.block<3, 3>(3,  6) = -(state_curr.rot * SO3Math::get_skew_symmetric(imu.accel_mpss * dt)); 
-            PHImat.block<3, 3>(3, 12) = -state_curr.rot.toRotationMatrix() * dt;
-            PHImat.block<3, 3>(3, 15) = I_33 * dt;
+            PHImat_.block<3, 3>(3,  6) = -(state_curr.rot * SO3Math::get_skew_symmetric(imu.accel_mpss * dt)); 
+            PHImat_.block<3, 3>(3, 12) = -state_curr.rot.toRotationMatrix() * dt;
+            PHImat_.block<3, 3>(3, 15) = I_33 * dt;
             // phi
-            // PHImat.block<3, 3>(6,  6) = SO3Math::Exp(-imu.gyro_rps * dt);
-            // PHImat.block<3, 3>(6,  9) = -SO3Math::J_l(imu.gyro_rps * dt).transpose() * dt;
-            PHImat.block<3, 3>(6,  6) = I_33 + SO3Math::get_skew_symmetric(-imu.gyro_rps * dt);  // 近似
-            PHImat.block<3, 3>(6,  9) = -I_33 * dt;                                              // 近似
+            // PHImat_.block<3, 3>(6,  6) = SO3Math::Exp(-imu.gyro_rps * dt);
+            // PHImat_.block<3, 3>(6,  9) = -SO3Math::J_l(imu.gyro_rps * dt).transpose() * dt;
+            PHImat_.block<3, 3>(6,  6) = I_33 + SO3Math::get_skew_symmetric(-imu.gyro_rps * dt);  // 近似
+            PHImat_.block<3, 3>(6,  9) = -I_33 * dt;                                              // 近似
 
             // 计算状态转移噪声协方差矩阵Q
-            Eigen::Matrix<double, 12, 12> qmat = Eigen::Matrix<double, 12, 12>::Zero();
-            double item[] = {   model_param_.VRW * model_param_.VRW,
-                                model_param_.ARW * model_param_.ARW,
-                                2 * model_param_.gyro_bias_std * model_param_.gyro_bias_std / model_param_.gyro_bias_corr_time,
-                                2 * model_param_.accel_bias_std * model_param_.accel_bias_std / model_param_.accel_bias_corr_time,
-                            };
-            for(int i = 0; i < 4; i++){
-                qmat.block<3, 3>(3 * i,  3 * i) = item[i] * M3D::Identity();
-            }
-            Gmat_ = Eigen::Matrix<double, N, 12>::Zero();
+            Gmat_.setZero();
             // Gmat_.block<3, 3>( 3, 0) = -state_curr.rot.toRotationMatrix() * dt;
             // Gmat_.block<3, 3>( 6, 3) = -SO3Math::J_l(imu.gyro_rps * dt).transpose() * dt;
             Gmat_.block<3, 3>( 3, 0) = -I_33 * dt; // 近似
             Gmat_.block<3, 3>( 6, 3) = -I_33 * dt; // 近似
             Gmat_.block<3, 3>( 9, 6) = I_33 * dt;
             Gmat_.block<3, 3>(12, 9) = I_33 * dt;
-            auto Qmat = Gmat_ * qmat * Gmat_.transpose();
+            auto Qmat = Gmat_ * qmat_ * Gmat_.transpose();
 
             // 状态转移
-            Pmat_ = PHImat * Pmat_ * PHImat.transpose() + Qmat;
+            Pmat_ = PHImat_ * Pmat_ * PHImat_.transpose() + Qmat;
         }
 
         
@@ -742,7 +750,7 @@ public:
         PointCloud::Ptr pcl_out = boost::make_shared<PointCloud>();
         point_cloud_undistort(measure, cloud_surf, pcl_out);
         
-        // 抽稀
+        // 间隔抽样
         auto pcl_out_sample = boost::make_shared<PointCloud>();
         for(int i = 0; i < pcl_out->size(); i++){
             if(i % sample_interval_ == 0)
@@ -807,8 +815,8 @@ public:
         cloud_msg.header.frame_id = "map";
         pub_surf_cloud.publish(cloud_msg);
 
-        // 将结果保存为文本文件
         if(is_save_traj_){
+            // 将结果保存为文本文件
             for(int i = 1; i < state_queue_.size() - 1;){
                 trajctory_writer_->write_txt(state_queue_[i].to_string());
                 i += 1;
