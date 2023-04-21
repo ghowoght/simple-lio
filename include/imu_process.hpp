@@ -24,6 +24,7 @@
 
 #include <vector>
 #include <queue>
+#include <algorithm>
 
 #include "so3_math.hpp"
 #include "tictoc.hpp"
@@ -191,6 +192,7 @@ private:
     // 单帧降采样参数
     pcl::VoxelGrid<PointType> surf_frame_ds_filter_;
     double surf_frame_ds_res_ = 0.5;
+    int sample_interval_ = 10; // 抽样间隔
 
     // 地图相关参数
     std::vector<PointCloud::Ptr> surf_cloud_queue_; // 用于初始化
@@ -217,7 +219,7 @@ public:
 
         // logger_ = spdlog::basic_logger_st("trajctory", "/home/ghowoght/workspace/lidar_ws/src/simple_lio/logger.txt");
 
-        // trajctory_writer_ = FileWriter::create("/home/ghowoght/workspace/lidar_ws2/src/simple_lio/result/trajctory.txt");
+        trajctory_writer_ = FileWriter::create("/home/ghowoght/trajctory.txt");
 
         surf_frame_ds_filter_.setLeafSize(surf_frame_ds_res_, surf_frame_ds_res_, surf_frame_ds_res_);
 
@@ -252,6 +254,7 @@ private:
             //////////////// 机械编排 ////////////////
             // 姿态更新
             state_curr.rot = state_curr.rot * SO3Math::Exp(imu.gyro_rps * dt);
+            state_curr.rot.normalize();
             // 速度更新
             state_curr.vel += (state_curr.rot * imu.accel_mpss - state_curr.grav) * dt;
             // 位置更新
@@ -267,7 +270,7 @@ private:
             // p
             PHImat.block<3, 3>(0,  3) = I_33 * dt;  
             // v
-            PHImat.block<3, 3>(3,  6) = -SO3Math::get_skew_symmetric(state_curr.rot * imu.accel_mpss) * dt; 
+            PHImat.block<3, 3>(3,  6) = -(state_curr.rot * SO3Math::get_skew_symmetric(imu.accel_mpss * dt)); 
             PHImat.block<3, 3>(3, 12) = -state_curr.rot.toRotationMatrix() * dt;
             PHImat.block<3, 3>(3, 15) = I_33 * dt;
             // phi
@@ -331,6 +334,11 @@ private:
     void point_cloud_undistort(MeasureData& measure, PointCloud::Ptr& pcl_in, PointCloud::Ptr& pcl_out){
         // 将雷达坐标系下的点投影到扫描结束时刻的惯导坐标系下    
         int idx = 0;
+        double time_interval = measure.pcl_end_time - measure.pcl_beg_time;
+        // 按照时间对点云排序
+        std::sort(pcl_in->begin(), pcl_in->end(), [](const PointType& p1, const PointType& p2){
+            return p1.curvature < p2.curvature;
+        });
         for(int i = pcl_in->size() - 1; i >= 0; i--){
             auto& point_curr = (*pcl_in)[i];
             if(!std::isfinite(point_curr.x)
@@ -338,7 +346,6 @@ private:
                 || !std::isfinite(point_curr.z)){
                 continue;
             }
-            double time_interval = 0.1;
             double time_curr_point = measure.pcl_beg_time + point_curr.curvature * time_interval;
 
             auto p_to_add = (*pcl_in)[i];
@@ -409,8 +416,6 @@ private:
             std::vector<EffectFeature> effect_feature_queue; // 有效特征点队列
             // ROS_INFO("pcl_features: %d", pcl_features->size());
 
-            // omp_set_num_threads(MP_PROC_NUM);
-            // #pragma omp parallel for
             TicToc t_feat;
             double time_k_search = 0;
             for(int i = 0; i < pcl_features->size(); i++){
@@ -593,21 +598,48 @@ private:
 
 public:
     bool init_imu(MeasureData& measure){
+        const int imu_buffer_size = 100;
         static int cnt = 0;
-        for(auto& imu : measure.imu_queue){
-            state_last_.ba += imu.accel_mpss;
-            state_last_.bg += imu.gyro_rps;
-            cnt++;
+        static bool init_flag = false;
+        static std::vector<ImuData> imu_queue;
+        if(cnt < imu_buffer_size){
+            for(auto& imu : measure.imu_queue){
+                imu_queue.push_back(imu);
+                state_last_.ba += imu.accel_mpss;
+                state_last_.bg += imu.gyro_rps;
+                cnt++;
+            }
         }
-        if(cnt > 1000){
-            state_last_.grav << 0, 0, -9.7936;
+        else if(cnt >= imu_buffer_size && !init_flag){
+            const double g = 9.81;  // 重力加速度大小
+            state_last_.grav << 0, 0, g;
             state_last_.bg /= (double)cnt;
-            state_last_.ba /= (double)cnt;
-            state_last_.ba -= state_last_.grav;
-            cnt = 0;
-            return true;
+            
+            // 加速度计测量值
+            const V3D accel = state_last_.ba / (double)cnt;
+            
+            // 轴线转换为旋转矩阵
+            auto axis_to_matrix = [](const V3D& axis, M3D& R){
+                R.col(0) = V3D(1, 0, 0);
+                R.col(1) = V3D(0, 1, 0);
+                R.col(2) = -axis;
+                R.col(0) -= R.col(0).dot(R.col(2)) / R.col(2).dot(R.col(2)) * R.col(2);
+                R.col(0).normalize();
+                R.col(1) -= R.col(1).dot(R.col(2)) / R.col(2).dot(R.col(2)) * R.col(2);
+                R.col(1) -= R.col(1).dot(R.col(0)) / R.col(0).dot(R.col(0)) * R.col(0);
+                R.col(1).normalize();
+            };
+            auto accel_normed = accel / accel.norm();
+            M3D R;
+            axis_to_matrix(accel_normed, R);
+            state_last_.rot = R.transpose();
+            state_last_.ba = accel - state_last_.rot.conjugate() * state_last_.grav;
+
+            auto bias = state_last_.rot * (accel - state_last_.ba) - state_last_.grav;
+
+            init_flag = true;
         }
-        return false;
+        return init_flag;
     }
     void process(MeasureData& measure){
         
@@ -656,7 +688,16 @@ public:
         // 点云运动补偿，转换到该帧结束时的惯导坐标系下
         PointCloud::Ptr pcl_out = boost::make_shared<PointCloud>();
         point_cloud_undistort(measure, cloud_surf, pcl_out);
-        // 降采样
+        
+        // 抽稀
+        auto pcl_out_sample = boost::make_shared<PointCloud>();
+        for(int i = 0; i < pcl_out->size(); i++){
+            if(i % sample_interval_ == 0)
+                pcl_out_sample->push_back((*pcl_out)[i]);
+        }
+        pcl_out = pcl_out_sample;
+
+        // 体素降采样
         surf_frame_ds_filter_.setInputCloud(pcl_out);
         PointCloud::Ptr pcl_out_filtered(new PointCloud);
         surf_frame_ds_filter_.filter(*pcl_out_filtered);
@@ -714,7 +755,11 @@ public:
         pub_surf_cloud.publish(cloud_msg);
 
         // 将结果保存为文本文件
-        if(0){
+        if(1){
+            for(int i = 1; i < state_queue_.size() - 1;){
+                trajctory_writer_->write_txt(state_queue_[i].to_string());
+                i += 1;
+            }
             trajctory_writer_->write_txt(state_last_.to_string());
         }
     }
