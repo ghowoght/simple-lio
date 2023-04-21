@@ -11,8 +11,8 @@ imu_params:
   accel_bias_corr_time: 1
 
 lidar_params:
-  R_plane: 0.01               # 平面观测噪声方差
-  sample_interval: 5          # 抽样间隔
+  R_plane: 0.001               # 平面观测噪声方差
+  sample_interval: 10          # 抽样间隔
   t_l_i: [ 0, 0, 0]
   r_l_i: [ 1, 0, 0,
           0, 1, 0,
