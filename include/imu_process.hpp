@@ -268,7 +268,7 @@ public:
         ROS_INFO("sample_interval_: %d", sample_interval_);
         max_iter_times_ = config["max_iter_times"].as<int>();
         ROS_INFO("max_iter_times_: %d", max_iter_times_);
-        blind_area_radius_ = config["blind_area_radius"].as<double>();
+        blind_area_radius_ = config["lidar_params"]["blind_area_radius"].as<double>();
         ROS_INFO("blind_area_radius_: %f", blind_area_radius_);
 
         // 初始化发布器
