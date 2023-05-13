@@ -3,16 +3,17 @@ topic:
   lidar: /livox/lidar
 
 imu_params:
-  ARW: 0.003 
-  VRW: 0.4
-  gyro_bias_std: 0.01
+  ARW: 0.2 
+  VRW: 0.2
+  gyro_bias_std: 200
   gyro_bias_corr_time: 1
-  accel_bias_std: 0.01      
+  accel_bias_std: 1000      
   accel_bias_corr_time: 1
 
 lidar_params:
-  R_plane: 0.001               # 平面观测噪声方差
-  sample_interval: 10          # 抽样间隔
+  blind_area_radius: 0.5      # 盲区半径
+  R_plane: 0.0001               # 平面观测噪声方差
+  sample_interval: 5          # 抽样间隔
   t_l_i: [ 0, 0, 0]
   r_l_i: [ 1, 0, 0,
           0, 1, 0,
@@ -22,7 +23,7 @@ lidar_params:
 max_iter_times: 10           # 最大迭代次数
 
 surf_map:
-  res: 0.5                    # 地图分辨率 (m)
+  res: 0.2                    # 地图分辨率 (m)
 
 result:
   enable: true                # 是否保存结果

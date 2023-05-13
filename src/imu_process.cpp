@@ -70,7 +70,7 @@ int main(int argc, char** argv)
                 ImuData imu;
                 imu.time = imu_msg->header.stamp.toSec();
                 imu.accel_mpss << accel_mpss.x, accel_mpss.y, accel_mpss.z;
-                // imu.accel_mpss *= 9.81; // LiLi-OM数据
+                imu.accel_mpss *= 9.7936; // LiLi-OM数据
                 imu.gyro_rps   << gyro_rps.x, gyro_rps.y, gyro_rps.z;
                 meas.imu_queue.push_back(imu);
 
@@ -96,12 +96,13 @@ int main(int argc, char** argv)
     ModelParam model_param;
 
     // 读取imu & lidar参数
-    model_param.ARW                  = config["imu_params"]["ARW"].as<double>(); 
-    model_param.VRW                  = config["imu_params"]["VRW"].as<double>();  
-    model_param.gyro_bias_std        = config["imu_params"]["gyro_bias_std"].as<double>();
-    model_param.gyro_bias_corr_time  = config["imu_params"]["gyro_bias_corr_time"].as<double>(); 
-    model_param.accel_bias_std       = config["imu_params"]["accel_bias_std"].as<double>();      
-    model_param.accel_bias_corr_time = config["imu_params"]["accel_bias_corr_time"].as<double>();
+    model_param.ARW                  = config["imu_params"]["ARW"].as<double>() / 60.0 * SO3Math::D2R;              // deg/sqrt(hr)
+    model_param.VRW                  = config["imu_params"]["VRW"].as<double>() / 60.0;                             // m/s/sqrt(hr)  
+    model_param.gyro_bias_std        = config["imu_params"]["gyro_bias_std"].as<double>() * SO3Math::D2R / 3600.0;  // deg/hr 
+    model_param.gyro_bias_corr_time  = config["imu_params"]["gyro_bias_corr_time"].as<double>() * 3600.0;  
+    model_param.accel_bias_std       = config["imu_params"]["accel_bias_std"].as<double>() * 1e-5;                  // mGal 1mGal=1e-3Gal=1e-5m/s^2
+    model_param.accel_bias_corr_time = config["imu_params"]["accel_bias_corr_time"].as<double>() * 3600.0;
+
     model_param.R                    = config["lidar_params"]["R_plane"].as<double>();
 
     // 读取外参

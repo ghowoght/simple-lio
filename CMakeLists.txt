@@ -56,3 +56,9 @@ target_link_libraries(imu_process
   spdlog::spdlog
   ${YAML_CPP_LIBRARIES}
 )
+
+# TBB
+find_package(TBB REQUIRED)
+target_link_libraries(imu_process
+  TBB::tbb
+)

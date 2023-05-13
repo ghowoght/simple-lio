@@ -11,7 +11,7 @@
 #ifndef IMU_PROCESS_HPP
 #define IMU_PROCESS_HPP
 
-#include <omp.h>
+#include <tbb/tbb.h>
 
 #include <Eigen/Core>
 #include <Eigen/Dense>
@@ -201,13 +201,14 @@ private:
     pcl::VoxelGrid<PointType> surf_frame_ds_filter_;
     double surf_frame_ds_res_ = 0.5;
     int sample_interval_ = 10; // 抽样间隔
+    double blind_area_radius_; // 盲区半径
 
     // 地图相关参数
     std::vector<PointCloud::Ptr> surf_cloud_queue_; // 用于初始化
     PointCloud::Ptr map_surf_cloud_;        // 用于初始化
     double map_res_ = 0.5;                  // 地图分辨率
-    std::vector<PointVector> nearest_list_; // 当前帧每一个点的最近邻搜索结果
-    bool is_surf_list_[100000] = {false};   // 一帧最多10万点
+    tbb::concurrent_vector<PointVector> nearest_list_; // 当前帧每一个点的最近邻搜索结果
+    tbb::concurrent_vector<bool> is_surf_list_;   // 一帧最多10万点
     int KNN_MATCH_NUM = 5;                  // K近邻匹配点数
     KD_TREE<PointType>::Ptr ikd_tree_;
 
@@ -267,6 +268,8 @@ public:
         ROS_INFO("sample_interval_: %d", sample_interval_);
         max_iter_times_ = config["max_iter_times"].as<int>();
         ROS_INFO("max_iter_times_: %d", max_iter_times_);
+        blind_area_radius_ = config["blind_area_radius"].as<double>();
+        ROS_INFO("blind_area_radius_: %f", blind_area_radius_);
 
         // 初始化发布器
         pub_surf_map    = nh_.advertise<sensor_msgs::PointCloud2>("/surf_map", 1);
@@ -285,11 +288,12 @@ public:
         Pmat_.setIdentity();
         M3D Imat = M3D::Identity();
         Pmat_.block<3, 3>(0, 0) = M3D::Zero();
-        Pmat_.block<3, 3>(3, 3) = Imat * 0.01;
-        Pmat_.block<3, 3>(6, 6) = Imat * 0.00001;
-        Pmat_.block<3, 3>(9, 9) = Imat * 0.00001;
-        Pmat_.block<3, 3>(12, 12) = Imat * 0.00001;
-        Pmat_.block<3, 3>(15, 15) = Imat * 0.00001;
+        Pmat_.block<3, 3>(3, 3) = Imat * 1e-9;
+        Pmat_.block<3, 3>(6, 6) = Imat * 1e-9;
+        Pmat_.block<3, 3>(9, 9) = Imat * 1e-9;
+        Pmat_.block<3, 3>(12, 12) = Imat * 1e-9;
+        Pmat_.block<3, 3>(15, 15) = Imat * 1e-9;
+
 
         // 初始化q
         qmat_.setZero();
@@ -349,15 +353,23 @@ private:
             PHImat_.block<3, 3>(6,  6) = I_33 + SO3Math::get_skew_symmetric(-imu.gyro_rps * dt);  // 近似
             PHImat_.block<3, 3>(6,  9) = -I_33 * dt;                                              // 近似
 
+            // bg
+            PHImat_.block<3, 3>(9, 9) = (1 - dt / model_param_.gyro_bias_corr_time) * I_33;
+            // ba
+            PHImat_.block<3, 3>(12, 12) = (1 - dt / model_param_.accel_bias_corr_time) * I_33;
+
             // 计算状态转移噪声协方差矩阵Q
             Gmat_.setZero();
-            // Gmat_.block<3, 3>( 3, 0) = -state_curr.rot.toRotationMatrix() * dt;
-            // Gmat_.block<3, 3>( 6, 3) = -SO3Math::J_l(imu.gyro_rps * dt).transpose() * dt;
-            Gmat_.block<3, 3>( 3, 0) = -I_33 * dt; // 近似
-            Gmat_.block<3, 3>( 6, 3) = -I_33 * dt; // 近似
-            Gmat_.block<3, 3>( 9, 6) = I_33 * dt;
-            Gmat_.block<3, 3>(12, 9) = I_33 * dt;
-            auto Qmat = Gmat_ * qmat_ * Gmat_.transpose();
+            // Gmat_.block<3, 3>( 3, 0) = -state_curr.rot.toRotationMatrix();
+            // Gmat_.block<3, 3>( 6, 3) = -SO3Math::J_l(imu.gyro_rps * dt).transpose();
+            Gmat_.block<3, 3>( 3, 0) = -I_33; // 近似
+            Gmat_.block<3, 3>( 6, 3) = -I_33; // 近似
+            Gmat_.block<3, 3>( 9, 6) = I_33;
+            Gmat_.block<3, 3>(12, 9) = I_33;
+            // 梯形积分
+            auto Qmat = 
+                0.5 * dt * (PHImat_ * Gmat_ * qmat_ * Gmat_.transpose() 
+                + Gmat_ * qmat_ * Gmat_.transpose() * PHImat_.transpose());
 
             // 状态转移
             Pmat_ = PHImat_ * Pmat_ * PHImat_.transpose() + Qmat;
@@ -473,78 +485,92 @@ private:
         bool is_converge = true;
         int converge_cnt = 0;
         nearest_list_.resize(pcl_features->size());
+        is_surf_list_ = tbb::concurrent_vector<bool>(pcl_features->size(), false);
         for(int iter = 0; iter < max_iter_times_; iter++){
-            std::vector<EffectFeature> effect_feature_queue; // 有效特征点队列
-            // ROS_INFO("pcl_features: %d", pcl_features->size());
-
             TicToc t_feat;
             double time_k_search = 0;
+
+            tbb::concurrent_vector<EffectFeature> feature_queue(pcl_features->size()); // 特征点队列
+            tbb::concurrent_vector<int> feature_flags(pcl_features->size(), 0); // 特征点标志位，0为无效，1为有效
+
+            auto find_surf_feats = [&](const tbb::blocked_range<size_t> &range){
+                for (size_t i = range.begin(); i != range.end(); i++) {
+                    auto p = (*pcl_features)[i];
+                    // 将特征点投影到世界坐标系
+                    V3D cp(p.x, p.y, p.z);
+                    V3D wp = state_curr_iter.rot * cp + state_curr_iter.pos;
+                    p.x = wp.x();
+                    p.y = wp.y();
+                    p.z = wp.z(); 
+                    if(!std::isfinite(wp.x()) || std::isnan(wp.x())){
+                        std::cout << "iter: " << iter << " i: " << i << "/" << pcl_features->size() << " cp: " << cp.transpose() << std::endl;
+                    }
+                    auto& nearest = nearest_list_[i];
+                    if(is_converge){
+                        // 最近邻搜索
+                        TicToc t_kdtree;
+                        std::vector<float> pointSearchSqDis; // 最近邻搜索结果的距离，从小到大排列
+                        ikd_tree_->Nearest_Search(p, KNN_MATCH_NUM, nearest, pointSearchSqDis);
+                        time_k_search += t_kdtree.toc();
+
+                        // 最近邻都在指定范围内
+                        if(pointSearchSqDis[KNN_MATCH_NUM - 1] < 5.0 
+                            && nearest.size() >= KNN_MATCH_NUM){
+                                is_surf_list_[i] = true;
+                        }
+                    }
+                    if(!is_surf_list_[i]){
+                        continue;
+                    }
+
+                    // 求解方程Ax=b
+                    Eigen::Matrix<double, Eigen::Dynamic, 3> A = Eigen::MatrixXd::Zero(KNN_MATCH_NUM, 3);
+                    Eigen::Matrix<double, Eigen::Dynamic, 1> b = Eigen::VectorXd::Ones(KNN_MATCH_NUM) * (-1.0);
+                    for(int k = 0; k < KNN_MATCH_NUM; k++){
+                        A(k, 0) = nearest[k].x;
+                        A(k, 1) = nearest[k].y;
+                        A(k, 2) = nearest[k].z;
+                    }
+                    V3D normvec = A.colPivHouseholderQr().solve(b); // 求解法向量
+                    double norm = normvec.norm(); // 法向量模长
+                    normvec.normalize(); // 法向量归一化
+
+                    Eigen::Vector4d abcd;
+                    abcd(0) = normvec(0);
+                    abcd(1) = normvec(1);
+                    abcd(2) = normvec(2);
+                    abcd(3) = 1 / norm;
+                    // 判断最近邻是否在同一平面
+                    bool is_plane = true;
+                    for(int k = 0; k < KNN_MATCH_NUM; k++){
+                        if(abcd(0) * nearest[k].x + abcd(1) * nearest[k].y + abcd(2) * nearest[k].z + abcd(3) > 0.1){
+                            is_plane = false;
+                            break;
+                        }
+                    }
+                    if(is_plane){
+                        // 计算点到平面的距离
+                        double res = abcd(0) * wp.x() + abcd(1) * wp.y() + abcd(2) * wp.z() + abcd(3);
+                        // 判断是否为有效特征点
+                        double s = 1 - 0.9 * fabs(res) / sqrt(cp.norm());
+                        if(s > 0.9){
+                            V3D nearest_point;
+                            nearest_point << nearest[0].x, nearest[0].y, nearest[0].z;
+                            feature_queue[i] = EffectFeature{cp, normvec, res};
+                            feature_flags[i] = 1;
+                        }
+                        else
+                            is_surf_list_[i] = false;
+                    }
+                }
+            };
+            tbb::parallel_for(tbb::blocked_range<size_t>(0, pcl_features->size()), find_surf_feats);
+
+            std::vector<EffectFeature> effect_feature_queue; // 有效特征点队列
             for(int i = 0; i < pcl_features->size(); i++){
-                auto p = (*pcl_features)[i];
-                // 将特征点投影到世界坐标系
-                V3D cp(p.x, p.y, p.z);
-                V3D wp = state_curr_iter.rot * cp + state_curr_iter.pos;
-                p.x = wp.x();
-                p.y = wp.y();
-                p.z = wp.z(); 
-                if(!std::isfinite(wp.x()) || std::isnan(wp.x())){
-                    std::cout << "iter: " << iter << " i: " << i << "/" << pcl_features->size() << " cp: " << cp.transpose() << std::endl;
-                }
-                auto& nearest = nearest_list_[i];
-                if(is_converge){
-                    // 最近邻搜索
-                    TicToc t_kdtree;
-                    std::vector<float> pointSearchSqDis; // 最近邻搜索结果的距离，从小到大排列
-                    ikd_tree_->Nearest_Search(p, KNN_MATCH_NUM, nearest, pointSearchSqDis);
-                    time_k_search += t_kdtree.toc();
-
-                    // 最近邻都在指定范围内
-                    if(pointSearchSqDis[KNN_MATCH_NUM - 1] < 5.0 
-                        && nearest.size() >= KNN_MATCH_NUM){
-                            is_surf_list_[i] = true;
-                    }
-                }
-                if(!is_surf_list_[i]){
-                    continue;
-                }
-
-                // 求解方程Ax=b
-                Eigen::Matrix<double, Eigen::Dynamic, 3> A = Eigen::MatrixXd::Zero(KNN_MATCH_NUM, 3);
-                Eigen::Matrix<double, Eigen::Dynamic, 1> b = Eigen::VectorXd::Ones(KNN_MATCH_NUM) * (-1.0);
-                for(int k = 0; k < KNN_MATCH_NUM; k++){
-                    A(k, 0) = nearest[k].x;
-                    A(k, 1) = nearest[k].y;
-                    A(k, 2) = nearest[k].z;
-                }
-                V3D normvec = A.colPivHouseholderQr().solve(b); // 求解法向量
-                double norm = normvec.norm(); // 法向量模长
-                normvec.normalize(); // 法向量归一化
-
-                Eigen::Vector4d abcd;
-                abcd(0) = normvec(0);
-                abcd(1) = normvec(1);
-                abcd(2) = normvec(2);
-                abcd(3) = 1 / norm;
-                // 判断最近邻是否在同一平面
-                bool is_plane = true;
-                for(int k = 0; k < KNN_MATCH_NUM; k++){
-                    if(abcd(0) * nearest[k].x + abcd(1) * nearest[k].y + abcd(2) * nearest[k].z + abcd(3) > 0.1){
-                        is_plane = false;
-                        break;
-                    }
-                }
-                if(is_plane){
-                    // 计算点到平面的距离
-                    double res = abcd(0) * wp.x() + abcd(1) * wp.y() + abcd(2) * wp.z() + abcd(3);
-                    // 判断是否为有效特征点
-                    double s = 1 - 0.9 * fabs(res) / sqrt(cp.norm());
-                    if(s > 0.9)
-                        effect_feature_queue.push_back(EffectFeature{cp, normvec, res});
-                    else
-                        is_surf_list_[i] = false;
-                }
+                if(feature_flags[i])
+                    effect_feature_queue.push_back(feature_queue[i]);
             }
-            // spdlog::info("iter: {} points: {} feat: {} time_k_search: {} total_time: {}", iter, pcl_features->size(), effect_feature_queue.size(), time_k_search, t_feat.toc());
 
             Hmat_ = Eigen::MatrixXd::Zero(effect_feature_queue.size(), N);
             delta_z_ = Eigen::VectorXd::Zero(effect_feature_queue.size());
@@ -672,7 +698,7 @@ public:
             }
         }
         else if(cnt >= imu_buffer_size && !init_flag){
-            const double g = 9.81;  // 重力加速度大小
+            const double g = 9.7936;  // 重力加速度大小
             state_last_.grav << 0, 0, g;
             state_last_.bg /= (double)cnt;
             
@@ -699,12 +725,18 @@ public:
             auto bias = state_last_.rot * (accel - state_last_.ba) - state_last_.grav;
 
             init_flag = true;
-        }
+        } 
         return init_flag;
     }
     void process(MeasureData& measure){
         
-        auto& cloud_surf = measure.cloud;
+        // 刪除盲区以内的点
+        PointCloud::Ptr cloud_surf(new PointCloud);
+        for(int i = 0; i < measure.cloud->size(); i++){
+            auto& p = (*measure.cloud)[i];
+            if(p.getVector3fMap().norm() > blind_area_radius_)
+                cloud_surf->push_back(p);
+        }
 
         if(!is_initialized_){
             // 转换到惯性系
@@ -726,7 +758,7 @@ public:
             sor.filter(*surf_filtered);
             map_surf_cloud_ = surf_filtered;
 
-            if(map_surf_cloud_->size() > 1000 && init_imu(measure)){
+            if(map_surf_cloud_->size() > 100 && init_imu(measure)){
                 is_initialized_ = true;
                 state_last_.time = measure.imu_queue.back().time;
                 ikd_tree_->Build(map_surf_cloud_->points);
