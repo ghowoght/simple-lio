@@ -7,6 +7,8 @@
 #include <queue>
 #include <thread>
 #include <chrono>
+#include <future>
+#include <mutex>
 
 #include "imu_process.hpp"
 #include "tictoc.hpp"
@@ -24,9 +26,10 @@ int main(int argc, char** argv)
 
     std::string imu_topic = config["topic"]["imu"].as<std::string>();
 
-    std::queue<MeasureData> measure_queue;
     std::queue<sensor_msgs::ImuConstPtr> imu_queue;
     std::queue<sensor_msgs::PointCloud2ConstPtr> cloud_queue;
+    std::queue<MeasureData> measure_queue;
+    std::mutex measure_queue_mutex;
 
     ros::Subscriber imu_sub = nh.subscribe<sensor_msgs::Imu>(imu_topic, 100, [&](const sensor_msgs::ImuConstPtr & msg)
     {   
@@ -34,39 +37,36 @@ int main(int argc, char** argv)
 
         if(cloud_queue.empty()) return;
 
-        auto pcl_msg = cloud_queue.front();
-        auto pcl_beg_time = pcl_msg->header.stamp.toSec();
-        auto pcl_end_time = pcl_msg->header.stamp.toSec() + 0.1;
+        auto pcl_beg_time = cloud_queue.front()->header.stamp.toSec();
+        auto pcl_end_time = cloud_queue.front()->header.stamp.toSec() + 0.1;
         while(!cloud_queue.empty() 
-            && !imu_queue.empty()
-            && imu_queue.front()->header.stamp.toSec() > pcl_end_time) // imu时刻比当前帧点云晚，则丢弃该帧点云
+            && !imu_queue.empty())
         {
+            pcl_beg_time = cloud_queue.front()->header.stamp.toSec();
+            pcl_end_time = cloud_queue.front()->header.stamp.toSec() + 0.1;
+            if(imu_queue.front()->header.stamp.toSec() < pcl_end_time){
+                break;
+            }
             cloud_queue.pop();
-            pcl_msg = cloud_queue.front();
-            pcl_beg_time = pcl_msg->header.stamp.toSec();
-            pcl_end_time = pcl_msg->header.stamp.toSec() + 0.1;
         }
 
         if(!cloud_queue.empty() 
             && !imu_queue.empty()
             && imu_queue.back()->header.stamp.toSec() > pcl_end_time)
         {
-            cloud_queue.pop();            
-            auto imu_msg = imu_queue.front();
-            auto imu_time = imu_msg->header.stamp.toSec();
+            auto pcl_msg = cloud_queue.front();
+            cloud_queue.pop();     
             MeasureData meas;
-            while(imu_time <= pcl_end_time)
-            {   
+            while(true){   
+                const auto imu_msg = imu_queue.front();
+                auto imu_time = imu_msg->header.stamp.toSec();
                 imu_queue.pop();
-
-                if(imu_time < pcl_beg_time){
-                    imu_msg = imu_queue.front();
-                    imu_time = imu_msg->header.stamp.toSec();
-                    continue;
-                }
                 
-                auto&& accel_mpss = imu_msg->linear_acceleration;
-                auto&& gyro_rps = imu_msg->angular_velocity;
+                if(imu_time < pcl_beg_time) continue;
+                if(imu_time > pcl_end_time) break;
+                
+                auto& accel_mpss = imu_msg->linear_acceleration;
+                auto& gyro_rps = imu_msg->angular_velocity;
                 ImuData imu;
                 imu.time = imu_msg->header.stamp.toSec();
                 imu.accel_mpss << accel_mpss.x, accel_mpss.y, accel_mpss.z;
@@ -74,16 +74,13 @@ int main(int argc, char** argv)
                 imu.gyro_rps   << gyro_rps.x, gyro_rps.y, gyro_rps.z;
                 meas.imu_queue.push_back(imu);
 
-                imu_msg = imu_queue.front();
-                imu_time = imu_msg->header.stamp.toSec();
             }
             meas.pcl_beg_time = pcl_beg_time;
             meas.pcl_end_time = pcl_end_time;
             pcl::fromROSMsg(*pcl_msg, *meas.cloud);
             // 将数据打包到队列中
+            std::unique_lock<std::mutex> lock(measure_queue_mutex);
             measure_queue.push(meas); 
-            meas.cloud = nullptr;
-            meas.imu_queue.clear();
         }
     });
 
@@ -130,19 +127,26 @@ int main(int argc, char** argv)
 
     IMUProcess imu_process(model_param, private_nh);
 
+    std::future<void> imu_process_future = std::async(std::launch::async, [&](){
+        ros::spin();
+    });
+
     while(ros::ok()){
         if(!measure_queue.empty()){
-            auto& meas = measure_queue.front();
+            std::unique_lock<std::mutex> lock(measure_queue_mutex);
+            auto meas = measure_queue.front();
+            measure_queue.pop();
+            lock.unlock();
             // ROS_INFO("meas size: %d, imu_beg_time: %f, pcl_beg_time: %f", measure_queue.size(), meas.imu_queue.front().time, meas.pcl_beg_time);
             // ROS_INFO("meas size: %d, imu_end_time: %f, pcl_end_time: %f", measure_queue.size(), meas.imu_queue.back().time, meas.pcl_end_time);
             // ROS_INFO("--------------------");
             TicToc t_process;
             imu_process.process(meas);
-            ROS_INFO("total process time: %f", t_process.toc());
+            ROS_INFO("measure_queue size: %d --- total process time: %f", measure_queue.size(), t_process.toc());
             ROS_INFO("--------------------");
-            measure_queue.pop();
         }
-        ros::spinOnce();
-        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        else{
+            std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        }
     }
 }
